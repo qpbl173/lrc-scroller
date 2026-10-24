@@ -69,6 +69,9 @@ export const EMPTY_LABEL = '（间奏）'
 /** 左/右对齐时文字与版心边缘的距离比例（预览是贴边，所以是 0） */
 export const EDGE_INSET = 0
 
+// 透明导出时，描边与填充先合成一行，再一起应用 opacity，匹配 CSS 的组透明度。
+const rowLayers = new WeakMap()
+
 /** 虚化关闭时，预览由 CSS 类附加的子元素透明度系数 */
 export const CSS_OPACITY = {
   empty: 0.35,
@@ -554,7 +557,7 @@ export function renderFrame({
   padTopRatio,
 }) {
   if (!canvas || typeof canvas.getContext !== 'function') return false
-  const ctx = canvas.getContext('2d')
+  let ctx = canvas.getContext('2d')
   if (!ctx) return false
 
   const W = canvas.width
@@ -568,8 +571,10 @@ export function renderFrame({
 
   // ── 1. 背景（铺满，绿幕/黑幕要覆盖；补边也用它） ──
   ctx.clearRect(0, 0, W, H)
-  ctx.fillStyle = resolveBgColor(color)
-  ctx.fillRect(0, 0, W, H)
+  if (settings?.export?.format !== 'mov-alpha') {
+    ctx.fillStyle = resolveBgColor(color)
+    ctx.fillRect(0, 0, W, H)
+  }
 
   if (!Array.isArray(lines) || lines.length === 0) return true
 
@@ -684,8 +689,39 @@ export function renderFrame({
    * @param {number} cy
    * @param {string} fill 已算好的填充色
    * @param {number} scale
+   * @param {number} [opacity=1]
    */
-  function drawRow(row, cy, fill, scale) {
+  function drawRow(row, cy, fill, scale, opacity = 1) {
+    if (settings?.export?.format === 'mov-alpha' && strokeOn && opacity < 1) {
+      if (!(opacity > 0)) return
+      let layer = rowLayers.get(canvas)
+      if (!layer) {
+        layer = canvas.cloneNode(false)
+        rowLayers.set(canvas, layer)
+      }
+      if (layer.width !== W) layer.width = W
+      if (layer.height !== H) layer.height = H
+      const target = ctx
+      const layerCtx = layer.getContext('2d')
+      if (!layerCtx) throw new Error('无法绘制透明描边图层')
+      layerCtx.clearRect(0, 0, W, H)
+      layerCtx.textBaseline = target.textBaseline
+      layerCtx.textAlign = target.textAlign
+      ctx = layerCtx
+      ctxFont = ''
+      try {
+        // fill 是本模块生成的 rgba()；图层内使用不透明填充，最终合成时统一渐隐。
+        drawRow(row, cy, fill.replace(/,[^,]+\)$/, ',1)'), scale)
+      } finally {
+        ctx = target
+        ctxFont = ''
+      }
+      target.save()
+      target.globalAlpha = opacity
+      target.drawImage(layer, 0, 0)
+      target.restore()
+      return
+    }
     const size = row.drawSize
     setFont(size)
 
@@ -862,16 +898,16 @@ export function renderFrame({
        */
       const c = mixHex(normalColor, activeColor, trans.colorProg)
       const a = applyCssOpacityFactors(opacities[i], row, true, fadeOn)
-      drawRow(row, cy, rgbaOf(c, a), lerp(1, effectiveScale, trans.scaleProg))
+      drawRow(row, cy, rgbaOf(c, a), lerp(1, effectiveScale, trans.scaleProg), a)
     } else if (isOutgoing) {
       // 上一行：颜色 active → normal，缩放 scale → 1
       const c = mixHex(activeColor, normalColor, trans.colorProg)
       const a = applyCssOpacityFactors(opacities[i], row, false, fadeOn)
-      drawRow(row, cy, rgbaOf(c, a), lerp(effectiveScale, 1, trans.scaleProg))
+      drawRow(row, cy, rgbaOf(c, a), lerp(effectiveScale, 1, trans.scaleProg), a)
     } else {
       const alpha = applyCssOpacityFactors(opacities[i], row, false, fadeOn)
       if (!(alpha > 0)) continue
-      drawRow(row, cy, rgba(normalColor, alpha), 1)
+      drawRow(row, cy, rgba(normalColor, alpha), 1, alpha)
     }
   }
 

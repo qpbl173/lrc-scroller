@@ -3357,6 +3357,16 @@ test('背景用用户设置的背景色（自定义背景也生效）', () => {
   assert.equal(bg.fillStyle, '#123456', '背景应使用用户设置的颜色')
 })
 
+test('透明 MOV 每帧先清除旧画面，不绘制任何背景', () => {
+  const s = { ...scrollSettings, export: { format: 'mov-alpha' } }
+  const probe = drawAt(s, [{ t: 0, text: '透明歌词', empty: false }], 1)
+  assert.equal(probe.ops[0].op, 'clearRect')
+  assert.equal(probe.ops.filter((op) => op.op === 'fillRect').length, 0)
+  assert.ok(probe.texts().length > 0)
+  const empty = drawAt(s, [], 0)
+  assert.deepEqual(empty.ops, [{ op: 'clearRect' }])
+})
+
 test('bgMode=green 时背景是绿幕色（优先于自定义色）', () => {
   const s = { ...scrollSettings, color: { ...scrollSettings.color, bg: '#123456', bgMode: 'green' } }
   const probe = makeProbeCanvas(1280, 720)

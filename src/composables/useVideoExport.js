@@ -1,6 +1,6 @@
 // @ts-check
 /**
- * 视频导出（渲染 + WebCodecs 编码 + MP4 封装 + 下载）。
+ * 视频导出：H.264 MP4，或逐帧 PNG 封装的透明 QuickTime MOV。
  *
  * 【导出不含音频轨】
  * 用户自己有音频，会在剪辑软件里对齐。所以这里**刻意不做**任何音频处理：
@@ -28,6 +28,7 @@
  * "导出中"标志会出现两个互不相通的副本。
  */
 import { Muxer, ArrayBufferTarget } from 'mp4-muxer'
+import { PngMovWriter } from '@/core/pngMov'
 import {
   renderFrame,
   buildOffsetTimeline,
@@ -283,9 +284,10 @@ export function useVideoExport() {
    * @param {Object} [opts]
    * @param {(done:number, total:number)=>void} [opts.onProgress]
    * @param {AbortSignal} [opts.signal]
+   * @param {(canvas:HTMLCanvasElement, index:number)=>Promise<void>} [opts.onFrame] 等待每帧写入后再继续，避免堆积画面数据
    * @returns {Promise<{ok:true, frames:number, elapsedMs:number} | {ok:false, reason:string, frames?:number}>}
    */
-  async function renderAll(canvasEl, { onProgress, signal } = {}) {
+  async function renderAll(canvasEl, { onProgress, signal, onFrame } = {}) {
     if (!canvasEl) return { ok: false, reason: 'no-canvas' }
 
     // 时长来源：有音频是音频长度；无音频时是"歌词末行 + 3 秒"
@@ -346,6 +348,7 @@ export function useVideoExport() {
         referenceWidth: geo?.refW,
         rowLayout: layout,
       })
+      if (onFrame) await onFrame(canvasEl, i)
       onProgress?.(i + 1, total)
 
       /*
@@ -397,6 +400,10 @@ export function useVideoExport() {
    */
   async function exportVideo(canvasEl, { onProgress, signal } = {}) {
     if (!canvasEl) return { ok: false, reason: 'no-canvas' }
+
+    if (settings.settings.export?.format === 'mov-alpha') {
+      return exportTransparentVideo(canvasEl, { onProgress, signal })
+    }
 
     const duration = player.duration
     if (!(duration > 0)) return { ok: false, reason: 'no-timeline' }
@@ -561,6 +568,77 @@ export function useVideoExport() {
       frames: total,
       bytes: blob.size,
       elapsedMs: performance.now() - startedAt,
+    }
+  }
+
+  /**
+   * PNG/MOV 不使用 VideoEncoder；PNG 的 RGBA 数据直接成为视频帧。
+   * 支持文件选择器时逐帧写磁盘，取消/失败时 abort 回滚未提交的写入。
+   * 其它浏览器使用有上限的 Blob，避免长视频耗尽浏览器内存。
+   */
+  async function exportTransparentVideo(canvasEl, { onProgress, signal } = {}) {
+    if (!(player.duration > 0)) return { ok: false, reason: 'no-timeline' }
+    if (signal?.aborted) return { ok: false, reason: 'aborted' }
+    const startedAt = performance.now()
+    const fps = Number(settings.settings.export?.fps) || DEFAULT_FPS
+    const size = exportSize()
+    const name = `lrc-transparent-${Date.now()}.mov`
+    let writer = null
+    let writable = null
+    let frames = 0
+    try {
+      // 必须在字体等待等异步操作前打开选择器，保留按钮点击的用户激活。
+      if (typeof window.showSaveFilePicker === 'function') {
+        const handle = await window.showSaveFilePicker({
+          suggestedName: name,
+          types: [{ description: '透明 QuickTime 视频（PNG）', accept: { 'video/quicktime': ['.mov'] } }],
+        })
+        writable = await handle.createWritable()
+      }
+      writer = new PngMovWriter({ ...size, fps, writable })
+      await writer.start()
+      canvasEl.width = size.width
+      canvasEl.height = size.height
+      const result = await renderAll(canvasEl, {
+        signal,
+        onProgress,
+        onFrame: async (canvas) => {
+          const png = await new Promise((resolve, reject) => canvas.toBlob(
+            (blob) => blob ? resolve(blob) : reject(new Error('无法生成透明视频帧')),
+            'image/png',
+          ))
+          if (signal?.aborted) return
+          await writer.addFrame(png)
+          frames++
+        },
+      })
+      if (!result.ok || signal?.aborted) {
+        await writer.abort()
+        return { ok: false, reason: signal?.aborted ? 'aborted' : result.reason, frames }
+      }
+      onProgress?.(frames, frames, 'finalize')
+      const output = await writer.finalize()
+      if (output.blob) {
+        const url = URL.createObjectURL(output.blob)
+        const a = document.createElement('a')
+        a.href = url
+        a.download = name
+        document.body.appendChild(a)
+        onProgress?.(frames, frames, 'download')
+        try { a.click() } finally {
+          a.remove()
+          setTimeout(() => URL.revokeObjectURL(url), 60_000)
+        }
+      }
+      return { ok: true, frames, bytes: output.bytes, elapsedMs: performance.now() - startedAt }
+    } catch (e) {
+      try {
+        if (writer) await writer.abort()
+        else if (writable) await writable.abort()
+      } catch { /* 保留原始错误 */ }
+      if (signal?.aborted || e?.name === 'AbortError') return { ok: false, reason: 'aborted', frames }
+      if (e?.name === 'MovMemoryLimitError') return { ok: false, reason: 'mov-too-large', frames }
+      throw e
     }
   }
 

@@ -130,12 +130,13 @@ export function createDefaultSettings() {
     },
 
     export: {
+      format: 'mp4', // mp4 | mov-alpha（无损 PNG，保留透明通道）
       /** 分辨率 preset id：480p | 720p | 1080p | 2k | 4k（见 RESOLUTION_PRESETS） */
       resolution: '720p',
       width: 1280,
       height: 720,
       fps: 30,
-      bgMode: 'solid', // solid | green | black | transparent(实验占位)
+      bgMode: 'solid', // solid | green | black（旧项目兼容字段）
       bitrateMbps: 8,
       watermark: '',
     },
@@ -328,6 +329,7 @@ export function sanitizeSettings(raw) {
   out.sync.firstBeatMs = pick(raw, 'sync.firstBeatMs', d.sync.firstBeatMs)
   out.sync.snap = pickEnum(pick(raw, 'sync.snap', d.sync.snap), ['none', 'nearest', 'next'], d.sync.snap)
 
+  out.export.format = pickEnum(pick(raw, 'export.format', d.export.format), ['mp4', 'mov-alpha'], d.export.format)
   out.export.resolution = pickEnum(
     pick(raw, 'export.resolution', d.export.resolution),
     RESOLUTION_PRESETS.map((p) => p.id),

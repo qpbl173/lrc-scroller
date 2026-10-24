@@ -67,7 +67,7 @@ export const TUTORIAL_STEPS = [
   {
     id: 'export',
     title: '第 4 步 · 导出视频',
-    body: '在设置面板里点「导出」，选好分辨率和帧率，再点「导出视频」就能拿到 MP4。',
+    body: '在设置面板里点「导出」，选择普通 MP4 或透明 MOV，选好分辨率和帧率，再点「导出视频」。',
     hint: '导出的是无声视频，音频请在自己的剪辑软件里对齐。',
     // 抽屉开着就指向真正的按钮，否则回落到「设置」（用户选了不自动开抽屉）
     targets: ['[data-tour="export-video"]', '[data-tour="export-toggle"]', '[data-tour="settings"]'],

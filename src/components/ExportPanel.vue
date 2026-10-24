@@ -5,7 +5,7 @@
  * 【两个导出入口并排】
  * 「导出 LRC」与「导出视频」放在同一行，用户不必在两个地方找"导出"。
  *   - 导出 LRC：把**已应用**的歌词写成 .lrc 文件（纯文本，瞬间完成）
- *   - 导出视频：渲染 + 编码 + 封装成无声 MP4
+ *   - 导出视频：普通 MP4 / 透明 MOV（均无声）
  *
  * 产出的 MP4 **不含音频轨** —— 音频由用户在自己的剪辑软件里对齐。
  * 「渲染当前帧」/「渲染全部帧」是预览（只画不编码），「导出视频」才真的产出文件。
@@ -76,6 +76,9 @@ const controller = ref(null)
  *   'unsupported' 都不支持，导出按钮禁用
  */
 const codecState = ref(/** @type {'probing'|'supported'|'unsupported'} */ ('probing'))
+const format = computed(() => settings.settings.export?.format ?? 'mp4')
+const transparent = computed(() => format.value === 'mov-alpha')
+let probeVersion = 0
 
 /** 当前选中的分辨率预设 */
 const resolution = computed(() => settings.settings.export?.resolution ?? '720p')
@@ -111,15 +114,20 @@ function syncCanvasSize() {
  * 探测用的参数必须和真正导出时一致，否则会得到"探测说行、导出却失败"。
  */
 async function probe() {
+  const version = ++probeVersion
+  if (transparent.value) {
+    codecState.value = typeof canvasRef.value?.toBlob === 'function' ? 'supported' : 'unsupported'
+    return
+  }
   const c = canvasRef.value
   const w = c?.width || 1280
   const h = c?.height || 720
   const bitrateBps = Math.round(bitrate.value * 1_000_000)
   try {
     const codec = await exporter.pickSupportedCodec(w, h, bitrateBps, fpsi.value)
-    codecState.value = codec ? 'supported' : 'unsupported'
+    if (version === probeVersion) codecState.value = codec ? 'supported' : 'unsupported'
   } catch {
-    codecState.value = 'unsupported'
+    if (version === probeVersion) codecState.value = 'unsupported'
   }
 }
 
@@ -128,11 +136,12 @@ onMounted(async () => {
   await probe()
 })
 
-// 换分辨率或帧率都要重新探测：编码器对分辨率/帧率的支持并不一致
-watch([resolution, fpsi], async () => {
+// 切换格式立即更新预览，避免透明模式仍显示上一次 MP4 的实心背景。
+watch([resolution, fpsi, format], async ([, , nextFormat], [, , prevFormat]) => {
   codecState.value = 'probing'
   lastRendered.value = null
   syncCanvasSize()
+  if (nextFormat !== prevFormat && !rendering.value) onRenderFrame()
   await probe()
 })
 
@@ -207,6 +216,8 @@ function describe(r) {
       return '已取消'
     case 'encode-failed':
       return '编码失败：画面数据无法编码，请重试'
+    case 'mov-too-large':
+      return '透明视频超过 512 MB 内存上限，请降低分辨率，或使用支持直接保存文件的 Chrome / Edge 重新导出'
     default:
       return '导出未能开始'
   }
@@ -247,6 +258,18 @@ function onCancel() {
     <!-- 分辨率 / 帧率：改完立刻反映到画布与编码探测 -->
     <div class="export-panel__settings">
       <label class="export-panel__field">
+        <span class="export-panel__label">视频格式</span>
+        <select
+          class="export-panel__control"
+          :value="format"
+          :disabled="rendering"
+          @change="settings.set('export.format', $event.target.value)"
+        >
+          <option value="mp4">MP4（普通背景）</option>
+          <option value="mov-alpha">MOV（透明背景，无损）</option>
+        </select>
+      </label>
+      <label class="export-panel__field">
         <span class="export-panel__label">分辨率</span>
         <select
           class="export-panel__control"
@@ -274,8 +297,14 @@ function onCancel() {
     </div>
 
     <p class="export-panel__note">
-      画布 {{ size.width }}×{{ size.height }} · {{ fpsi }} 帧 · 约 {{ bitrate }} Mbps
+      画布 {{ size.width }}×{{ size.height }} · {{ fpsi }} 帧
+      <template v-if="!transparent"> · 约 {{ bitrate }} Mbps</template>
       ——画面按预览舞台等比缩放，动效、行距、字距、字体与配色都与预览一致。
+    </p>
+    <p v-if="transparent" class="export-panel__note">
+      透明 MOV 保留歌词渐隐和半透明边缘，无需抠像。文件较大，建议先用 720p / 30 帧试导出。
+      支持时会先选择保存位置并直接写入磁盘；其它浏览器使用内存下载，上限 512 MB。
+      PNG 编码的 MOV 请导入支持该格式的剪辑软件，网页播放器可能无法预览。
     </p>
 
     <!--
@@ -340,7 +369,7 @@ function onCancel() {
 
     <!-- 编码不可用时给出明确指引（预览仍可用，所以只禁「导出视频」） -->
     <p v-if="codecState === 'unsupported'" class="export-panel__warn">
-      当前分辨率/帧率组合无法编码，请换一档分辨率或帧率，或改用最新版 Chrome / Edge。
+      {{ transparent ? '当前浏览器无法生成 PNG 视频帧，请使用最新版 Chrome / Edge。' : '当前分辨率/帧率组合无法编码，请换一档分辨率或帧率，或改用最新版 Chrome / Edge。' }}
     </p>
     <p v-else-if="codecState === 'probing'" class="export-panel__note">正在检测编码能力…</p>
 
@@ -362,9 +391,9 @@ function onCancel() {
       导出时请保持页面在前台，否则浏览器会节流后台标签页。
     </p>
 
-    <canvas ref="canvasRef" class="export-panel__canvas" width="1280" height="720" />
+    <canvas ref="canvasRef" class="export-panel__canvas" :class="{ 'export-panel__canvas--transparent': transparent }" width="1280" height="720" />
     <p class="export-panel__note">
-      导出的 MP4 不含音频轨，请在剪辑软件里对齐你的音频文件。
+      导出的视频不含音频轨，请在剪辑软件里对齐你的音频文件。
     </p>
   </div>
 </template>
@@ -448,6 +477,12 @@ function onCancel() {
   color: var(--ui-text-dim);
   font-size: var(--ui-font-xs);
   line-height: 1.45;
+}
+
+.export-panel__canvas--transparent {
+  background-color: #d4d4d4;
+  background-image: conic-gradient(#a3a3a3 25%, transparent 0 50%, #a3a3a3 0 75%, transparent 0);
+  background-size: 16px 16px;
 }
 
 .export-panel__warn {
