@@ -372,6 +372,16 @@ export function useTapping() {
   function setCharEnabled(on) {
     if (on) {
       const r = tapping.charEnable()
+
+      /*
+       * 【进入模式就必须把当前行展开成字表】
+       * charEnable 只对齐数组长度，不建任何一行的字表；
+       * 而界面的「逐字 N/M 字」与光标前后移都读 charChars，
+       * 未展开时它恒为空 —— 用户进来只看到「该行无字可打」，
+       * 光标按钮也点了没反应，必须先盲按一次空格才"活"过来。
+       * 实测就是这个表现，所以在开关打开后立刻初始化当前行。
+       */
+      tapping.charEnsureCurrentLine()
       if (r.discarded === 'hash-mismatch') {
         ui.push({
           level: 'warn',

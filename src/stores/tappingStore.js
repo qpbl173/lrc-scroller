@@ -690,6 +690,35 @@ export const useTappingStore = defineStore('tapping', {
     },
 
     /**
+     * 把"当前行"展开成字表（进入逐字模式时调用）。
+     *
+     * 【为什么需要它】
+     * charEnsureSize 只保证 charDraft 的**行数**对齐，不建任何一行的字表；
+     * 而界面读的是 charChars（= charDraft[charLineIndex]），
+     * 未展开时恒为空 → 界面显示"该行无字可打"、光标按钮点了没反应，
+     * 用户必须先盲按一次空格界面才活过来。这是实测到的可用性缺陷。
+     *
+     * 只展开当前一行，不预先拆全曲：2000 行的歌全拆会在进入模式时卡一下，
+     * 而用户此刻只看得到当前行。
+     *
+     * @returns {number} 展开后的字数（0 表示当前行不可打）
+     */
+    charEnsureCurrentLine() {
+      this.charEnsureSize()
+      const n = this.tapTarget.length
+      if (n === 0) return 0
+      // 恢复草稿后 charLineIndex 可能越界（歌词变短了）
+      const idx = Math.min(Math.max(0, this.charLineIndex), n - 1)
+      this.charLineIndex = idx
+      const chars = this._charBuildDraft(idx)
+      // 光标落在第一个没打过的字；全打过则回 0（通常是想重打）
+      if (!Number.isFinite(this.charCursor) || this.charCursor > chars.length - 1) {
+        this.charCursor = charRelocateCursor(chars)
+      }
+      return chars.length
+    },
+
+    /**
      * 建（或取）某一行的完整字表。
      * 单独抽出来，是为了让"只是把某行展开成字"与"打一个时间点"分开：
      * 界面在逐字模式下要显示每行的字，不能靠按空格来触发。
