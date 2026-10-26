@@ -113,6 +113,26 @@ export function useKeyboard() {
    * @param {KeyboardEvent} e
    */
   function onSpace(e) {
+    /*
+     * 第 1.5 档：逐字打轴 —— 比逐行更优先。
+     *
+     * 【为什么逐字必须排在逐行之前】
+     * 两套模式理论上不会同时开，但用户完全可能"逐行打完后忘了关、
+     * 又开了逐字"（两套草稿是并存的，所以两个 enabled 能同时为 true）。
+     * 此时按空格的意图一定是逐字 —— 那是更细的一层。
+     * 反过来先判逐行的话，空格会去改 tapped，逐字草稿一个字都不动，
+     * 而界面上逐字光标明明亮着，用户完全看不出发生了什么。
+     *
+     * 【必须 preventDefault】
+     * 与逐行同理：焦点可能还停在「逐字」按钮上，
+     * 不拦的话空格会激活按钮 → 退出逐字模式。
+     */
+    if (tapping.charMode) {
+      e.preventDefault()
+      tappingAPI.charTap()
+      return
+    }
+
     // 第 2 档：打轴模式 —— 空格永远是打轴，不管焦点在哪
     if (tapping.enabled) {
       // 【必须 preventDefault】
@@ -180,6 +200,12 @@ export function useKeyboard() {
      * 只认 ctrl/meta + z，其余修饰组合（Ctrl+Shift+Z 重做等）仍放行。
      */
     if ((e.ctrlKey || e.metaKey) && !e.altKey && (e.key === 'z' || e.key === 'Z')) {
+      // 逐字优先：两套草稿并存时，用户眼前的是逐字光标
+      const charWhat = tappingAPI.charUndoAny()
+      if (charWhat) {
+        e.preventDefault()
+        return
+      }
       const what = tappingAPI.undoAny()
       // 什么都没撤销时不该抢浏览器/输入框的原生撤销
       if (what) {
@@ -229,6 +255,15 @@ export function useKeyboard() {
       // ── 阶段 5 第 3 步：撤销 + 播放头固定回滚 5 秒 ──
       case 'z':
       case 'Z': {
+        /*
+         * 逐字模式下的 Z 是逐字撤销（不改播放头：逐字是原地精修）。
+         * 必须排在逐行之前，理由同 onSpace。
+         */
+        if (tapping.charMode) {
+          e.preventDefault()
+          tappingAPI.charUndo()
+          return
+        }
         // 只在打轴模式生效；非打轴模式不响应（避免和浏览器的撤销习惯冲突）
         if (!tapping.enabled) return
         e.preventDefault()
@@ -237,6 +272,17 @@ export function useKeyboard() {
       }
 
       case 'ArrowLeft': {
+        /*
+         * 逐字模式：←/→ 用于在字之间挪光标，而不是微调时间。
+         * 【为什么不让它微调时间】逐字已经有 Z 撤销这条"重打"路径，
+         * 而逐字时间是以"跟着音频按下空格"为准的，手改 ±10ms 意义不大；
+         * 更需要的是"我打错了哪个字，让我退回去"。
+         */
+        if (tapping.charMode) {
+          e.preventDefault()
+          tappingAPI.charStepCursor(-1)
+          return
+        }
         // 打轴模式：微调**刚打完那行**（lastTappedIndex）
         if (tapping.enabled) {
           e.preventDefault()
@@ -250,6 +296,11 @@ export function useKeyboard() {
       }
 
       case 'ArrowRight': {
+        if (tapping.charMode) {
+          e.preventDefault()
+          tappingAPI.charStepCursor(1)
+          return
+        }
         if (tapping.enabled) {
           e.preventDefault()
           tappingAPI.nudge(e.shiftKey ? NUDGE_STEP_BIG_MS : NUDGE_STEP_MS)

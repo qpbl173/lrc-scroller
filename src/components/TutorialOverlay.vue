@@ -87,6 +87,8 @@ const fallbackHint = computed(() => {
       return '请先点开被框住的「设置」按钮，教程会继续指引里面的入口。'
     case '[data-tour="export-toggle"]':
       return '再点一下被框住的「导出」按钮展开面板，就能看到「导出视频」。'
+    case '[data-tour="lyrics-info"]':
+      return '先点一下被框住的「歌词信息」展开面板，双语歌词的调换按钮就在里面。'
     default:
       return ''
   }

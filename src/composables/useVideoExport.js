@@ -105,25 +105,39 @@ export const KEYFRAME_SECONDS = 1
  * 画面只有文字，但 4K 的像素量是 720p 的 9 倍。用同一个码率，
  * 4K 会糊、720p 会白白浪费体积。这组值按"每百万像素约 1.6Mbps"估，
  * 再对极小/极大分辨率做夹取。
+ *
+ * 【为什么按像素量而不是按高度分档】
+ * 老版本按高度查表，是在"画布恒为 16:9"的前提下成立的。
+ * 加入竖版之后这个前提没了：9:16 的 1080×1920 高度比 1440p 横屏还高，
+ * 但像素量只有后者的三分之一 —— 按高度查会给出两倍以上的码率，文件白白变胖。
+ * 所以表改成按"像素数档位"分，横竖一视同仁。
+ * 键名保留 BITRATE_BY_HEIGHT 会误导，故改名为 BITRATE_BY_PIXELS。
  */
-export const BITRATE_BY_HEIGHT = [
-  { maxHeight: 480, mbps: 4 },
-  { maxHeight: 720, mbps: 8 },
-  { maxHeight: 1080, mbps: 14 },
-  { maxHeight: 1440, mbps: 24 },
-  { maxHeight: Infinity, mbps: 40 },
+export const BITRATE_BY_PIXELS = [
+  { maxPixels: 480 * 854, mbps: 4 }, // ≈0.41MP：480p 横屏
+  { maxPixels: 720 * 1280, mbps: 8 }, // ≈0.92MP：720p 横屏 / 480p 竖屏
+  { maxPixels: 1080 * 1920, mbps: 14 }, // ≈2.07MP：1080p 横屏 / 1080p 竖屏
+  { maxPixels: 1440 * 2560, mbps: 24 }, // ≈3.69MP：1440p 横屏 / 3:4 的 2K
+  { maxPixels: Infinity, mbps: 40 }, // 4K 横屏 ≈8.3MP / 4K 竖屏 ≈8.3MP
 ]
 
 /**
- * 按画布高度推荐码率（Mbps）。
- * @param {number} height
+ * 按画布像素量推荐码率（Mbps）。
+ *
+ * 参数名仍然是 height/width 两个数：调用方手上一般只有尺寸，
+ * 不该为了查个码率再去想"该传高度还是像素数"。
+ *
+ * @param {number} height 画布高（px）
+ * @param {number} [width] 画布宽（px）；不传时按 16:9 由高度反推，兼容老调用
  * @returns {number}
  */
-export function recommendBitrate(height) {
+export function recommendBitrate(height, width) {
   const h = Number(height)
   if (!Number.isFinite(h) || h <= 0) return 8
-  for (const row of BITRATE_BY_HEIGHT) {
-    if (h <= row.maxHeight) return row.mbps
+  const w = Number(width)
+  const pixels = Number.isFinite(w) && w > 0 ? w * h : h * h * (16 / 9)
+  for (const row of BITRATE_BY_PIXELS) {
+    if (pixels <= row.maxPixels) return row.mbps
   }
   return 8
 }
@@ -136,12 +150,14 @@ export function useVideoExport() {
   /**
    * 当前导出该用的画布尺寸。
    *
-   * 分辨率由 `settings.export.resolution` 决定（480p~4K），
-   * 直接用预设的 width/height，保证是标准的 16:9 成品尺寸。
+   * 比例由 `settings.export.aspect` 决定（16:9 / 9:16 / 3:4），
+   * 分辨率档位由 `settings.export.resolution` 决定（480p~4K）。
+   * 两者一起查表，拿到的是该比例下的真实尺寸 —— 竖版 1080p 是 1080×1920。
    * @returns {{width:number, height:number}}
    */
   function exportSize() {
-    const p = findResolution(settings.settings.export?.resolution)
+    const ex = settings.settings.export ?? {}
+    const p = findResolution(ex.resolution, ex.aspect)
     return { width: p.width, height: p.height }
   }
 
@@ -156,11 +172,13 @@ export function useVideoExport() {
    * @param {HTMLCanvasElement} canvasEl
    * @returns {{refW:number, refH:number, layout:any}|null}
    */
-  function collectGeometry(canvasEl) {
+  function collectGeometry(canvasEl, size) {
     const geo = readStageGeometry()
     if (!(geo.width > 0) || !(geo.height > 0)) return null
 
-    const k = canvasEl.height / geo.height
+    const canvasHeight = size?.height > 0 ? size.height : canvasEl?.height ?? 0
+    if (!(canvasHeight > 0)) return null
+    const k = canvasHeight / geo.height
     const layoutWidth = geo.width * k
 
     // 用临时 2D context 做文本测量（与正式渲染同一个 API，结果才可比）
@@ -227,20 +245,27 @@ export function useVideoExport() {
    * 单帧预览要的是"当前行精确停在锚点位置上"，所以用
    * centeringOffsetFor 算出与预览一致的位移（等于滚动已收敛的稳态）。
    *
+   * 【k 取"目标画布高"，而不是 canvasEl.height】
+   * 画布是常驻元素，尺寸由 ensureCanvasSize 写入；先对齐再取几何，
+   * 就不会出现"画布已是竖版、几何还按横版算"的半新半旧状态。
+   *
    * @param {HTMLCanvasElement|null} canvasEl
    * @param {number} t 时间（秒）
+   * @param {{width:number, height:number}} [size] 目标画布尺寸；缺省读 canvasEl
    * @returns {boolean} 是否成功画了一帧
    */
-  function renderPreview(canvasEl, t) {
+  function renderPreview(canvasEl, t, size) {
     if (!canvasEl) return false
-    const geo = collectGeometry(canvasEl)
+    ensureCanvasSize(canvasEl, size)
+    const geo = collectGeometry(canvasEl, size)
     const lines = lyrics.lines
     const lineIndex = findLineIndexAt(lines, t)
     // 与 renderAll / exportVideo 一致：让自定义上传的字体也参与这一帧
     const cfg = withCustomFont(settings.settings)
 
     const layout = geo?.layout
-    const off = layout ? centeringOffsetFor(layout, lineIndex, canvasEl.height, anchorRatio(cfg)) : 0
+    const canvasHeight = canvasEl.height
+    const off = layout ? centeringOffsetFor(layout, lineIndex, canvasHeight, anchorRatio(cfg)) : 0
 
     return renderFrame({
       lineIndex,
@@ -253,6 +278,24 @@ export function useVideoExport() {
       referenceWidth: geo?.refW,
       rowLayout: layout,
     })
+  }
+
+  /**
+   * 把画布的像素尺寸对齐到目标尺寸。
+   *
+   * "先比对再写"是刻意的：给 canvas.width/height 赋值会清空位图并触发重排，
+   * 逐帧渲染时这是热路径，尺寸没变就什么都不该做。
+   *
+   * @param {HTMLCanvasElement|null} canvasEl
+   * @param {{width:number, height:number}} [size]
+   */
+  function ensureCanvasSize(canvasEl, size) {
+    if (!canvasEl || !size) return
+    const w = Math.round(Number(size.width))
+    const h = Math.round(Number(size.height))
+    if (!(w > 0) || !(h > 0)) return
+    if (canvasEl.width !== w) canvasEl.width = w
+    if (canvasEl.height !== h) canvasEl.height = h
   }
 
   /**
@@ -302,7 +345,15 @@ export function useVideoExport() {
     // 字体必须先就绪：行高与换行宽度都取决于最终生效的字体
     await waitForFonts()
 
-    const geo = collectGeometry(canvasEl)
+    /*
+     * 画布尺寸自己保证，不依赖调用方先调过 syncCanvasSize。
+     * 三个入口（渲染当前帧 / 渲染全部 / 导出视频）都从这里取尺寸，
+     * 只要有一处忘了同步，就会得到"画布横版、几何竖版"的静默错帧。
+     */
+    const size = exportSize()
+    ensureCanvasSize(canvasEl, size)
+
+    const geo = collectGeometry(canvasEl, size)
     const refH = geo?.refH
     const H = canvasEl.height
 
@@ -408,18 +459,20 @@ export function useVideoExport() {
     const fps = Number(settings.settings.export?.fps) > 0 ? Number(settings.settings.export.fps) : DEFAULT_FPS
     const total = Math.max(1, Math.round(duration * fps))
 
-    // 分辨率跟着用户选的预设走（480p~4K）
+    /*
+     * 分辨率跟着用户选的预设走 —— 比例来自 export.aspect（16:9 / 9:16 / 3:4），
+     * 档位来自 export.resolution（480p~4K）。竖版 1080p 就是 1080×1920。
+     * 这里不做任何"按窗口尺寸再算一遍"的事：画布尺寸只能由设置决定，
+     * 否则同一份设置在不同屏幕上会导出不同尺寸的成品。
+     */
     const size = exportSize()
-    if (canvasEl.width !== size.width || canvasEl.height !== size.height) {
-      canvasEl.width = size.width
-      canvasEl.height = size.height
-    }
+    ensureCanvasSize(canvasEl, size)
     const W = canvasEl.width
     const H = canvasEl.height
 
-    // 码率：用户没显式改过（还等于默认 8）时，按分辨率推荐；改过就尊重用户
+    // 码率：用户没显式改过（还等于默认 8）时，按像素量推荐；改过就尊重用户
     const configured = Number(settings.settings.export?.bitrateMbps)
-    const mbps = configured > 0 && configured !== 8 ? configured : recommendBitrate(H)
+    const mbps = configured > 0 && configured !== 8 ? configured : recommendBitrate(H, W)
     const bitrate = Math.round(mbps * 1_000_000)
 
     /*
@@ -456,9 +509,9 @@ export function useVideoExport() {
     const microsPerFrame = 1e6 / fps
     const keyframeInterval = Math.max(1, Math.round(fps * KEYFRAME_SECONDS))
 
-    // 与 renderAll 同一套几何采集
+    // 与 renderAll 同一套几何采集（画布尺寸上面已经按 exportSize 对齐过）
     await waitForFonts()
-    const geo = collectGeometry(canvasEl)
+    const geo = collectGeometry(canvasEl, size)
     const refH = geo?.refH
 
     const layout =
@@ -572,6 +625,8 @@ export function useVideoExport() {
     exportSize,
     collectGeometry,
     recommendBitrate,
+    /** 把画布像素尺寸对齐到目标尺寸（预览/导出共用，避免两处各写一遍） */
+    ensureCanvasSize,
   }
 }
 

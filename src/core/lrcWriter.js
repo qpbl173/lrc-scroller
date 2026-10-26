@@ -231,7 +231,7 @@ export function buildMetaTags(meta) {
  * @returns {string} LRC 文本；没有任何可导出行时返回空串
  */
 export function buildLrcText(lines, options = {}) {
-  const { meta = null, includeMeta = true, precision = 2 } = options
+  const { meta = null, includeMeta = true, precision = 2, enhanced = false } = options
   const arr = Array.isArray(lines) ? lines : []
 
   /** @type {string[]} */
@@ -250,11 +250,128 @@ export function buildLrcText(lines, options = {}) {
     // formatTimeTag 已负责四舍五入与进位（如 59.999 → 01:00.00），
     // 这里不重复实现时间格式化 —— 那是 core/timeUtils 的职责
     const tag = formatTimeTag(t, precision)
+
+    if (enhanced) {
+      out.push(buildEnhancedLine(line, tag, precision))
+      continue
+    }
+
     const text = sanitizeLineText(/** @type {any} */ (line).text)
     out.push(`[${tag}]${text}`)
   }
 
   return out.join('\n')
+}
+
+/**
+ * 清洗一个**字符片段**（逐字数据里的单个字，可能带尾随标点或空格）。
+ *
+ * 【为什么不能复用 sanitizeLineText】
+ * 那个函数是给"整行正文"设计的，末尾有 .trim() —— 对整行是对的
+ * （LRC 正文首尾空白没有意义），但对**片段**是错的：
+ * 逐字拆字时空格被并进前一个字（"o " 表示 o 后面那个空格），
+ * trim 掉之后增强 LRC 就写成 <..>o<..>w，重新解析得到 "Helloworld"，
+ * 原文的空格永久丢失。实测就是这个 bug。
+ *
+ * 所以这里只处理换行（LRC 一行一条，换行必须消灭），
+ * 首尾空白原样保留。
+ *
+ * @param {unknown} seg
+ * @returns {string}
+ */
+function sanitizeCharSegment(seg) {
+  if (typeof seg !== 'string') return ''
+  return seg.replace(/[\r\n]+/g, ' ')
+}
+
+/**
+ * 造一行的增强 LRC 文本：`[mm:ss.cc]<mm:ss.cc>字<mm:ss.cc>字…`
+ *
+ * 【标准标签先写】
+ * 增强 LRC 里 `<…>` 只是一段注释性的补充，`[…]` 才是行的 anchor。
+ * 先写标准标签保证任何不支持增强格式的播放器都能正常滚动，
+ * 这正是"双写"里"主输出必须可播"的要求。
+ *
+ * 【为什么需要】
+ * 标准 LRC 无法表达逐字时间。若只写标准 LRC，逐字数据会在一次导出后彻底丢失；
+ * 若只写增强 LRC（不写 `[…]`），老播放器会整行不显示。
+ *
+ * @param {any} line
+ * @param {string} lineTag 已格式化的标准时间标签内容（不含方括号）
+ * @param {number} precision
+ * @returns {string}
+ */
+function buildEnhancedLine(line, lineTag, precision) {
+  const head = `[${lineTag}]`
+  const chars = /** @type {any} */ (line).chars
+  const t = Number(/** @type {any} */ (line).t)
+
+  if (!Array.isArray(chars) || chars.length === 0) {
+    // 这一行没有逐字数据（标准 LRC 打轴出来的行）→ 原样输出正文，不伪造逐字时间
+    return head + sanitizeLineText(/** @type {any} */ (line).text)
+  }
+
+  let body = ''
+  for (const ch of chars) {
+    if (!ch || typeof ch !== 'object') continue
+    const c = sanitizeCharSegment(ch.c)
+    // 纯空白的片段没有内容，跳过；但 'o ' 这种带尾随空格的有意义，保留
+    if (c.trim() === '') continue
+    // 字自己的时间无效 → 退回整行时间，绝不用 NaN 造出 `<NaN>`
+    const ct = Number.isFinite(Number(ch.t)) ? Number(ch.t) : t
+    body += `<${formatTimeTag(ct, precision)}>${c}`
+  }
+
+  if (body === '') {
+    // chars 全是空的：正文不能凭空消失，退回标准写法
+    return head + sanitizeLineText(/** @type {any} */ (line).text)
+  }
+
+  // 校验：逐字拼回来若比正文少字，补一个尾段，保证 round-trip 不丢字
+  const joined = body.replace(/<[^>]*>/g, '')
+  const full = sanitizeLineText(/** @type {any} */ (line).text)
+  if (joined.length < full.replace(/\s/g, '').length) {
+    body += full.slice(joined.length)
+  }
+
+  return head + body
+}
+
+/**
+ * 判断一组歌词行是否带有逐字数据。
+ *
+ * 调用方用它决定要不要额外产出增强 LRC —— 没有逐字数据时再写一个增强文件
+ * 只会得到一份与标准 LRC 字节相同的副本，没有意义。
+ *
+ * @param {Array<any>} lines
+ * @returns {boolean}
+ */
+export function hasAnyChars(lines) {
+  const arr = Array.isArray(lines) ? lines : []
+  for (const line of arr) {
+    if (line && Array.isArray(/** @type {any} */ (line).chars) && line.chars.length > 0) return true
+  }
+  return false
+}
+
+/**
+ * 双写：一次导出同时产出标准 LRC 与增强 LRC。
+ *
+ * 【为什么两个都要】
+ *   - 标准 LRC：任何播放器都能用（主输出，必须可播）
+ *   - 增强 LRC：保留 `<mm:ss.xx>` 逐字时间，重新导入本应用不丢数据
+ * 二者内容完全一致，只是增强版多了逐字标签。
+ *
+ * @param {Array<any>} lines
+ * @param {Object} [options] 同 buildLrcText，另见 enhancedSuffix
+ * @param {string} [options.enhancedSuffix=''] 增强文件名的后缀（写在扩展名之前）
+ * @returns {{standard:string, enhanced:string}}
+ */
+export function buildLrcDual(lines, options = {}) {
+  return {
+    standard: buildLrcText(lines, options),
+    enhanced: buildLrcText(lines, { ...options, enhanced: true }),
+  }
 }
 
 /**

@@ -30,6 +30,7 @@
  * 横向同理按 scale 缩放舞台宽度，于是换行位置也与预览一致 ——
  * 画布比舞台"更宽"时多出来的部分用背景色补边（用户看不到接缝）。
  */
+import { charProgressAt, isCharTimed } from './charProgress.js'
 import { hexToRgb } from './color.js'
 import { computeRenderOpacities, createDefaultFade } from './fade.js'
 import { smoothTowards, computeCenteringOffset } from './scroll.js'
@@ -643,8 +644,11 @@ export function renderFrame({
   /*
    * 锚点 x 必须夹取到画布内。
    *
-   * stageW 用的是舞台宽（预览宽高比），画布是固定 16:9。当舞台比画布"更宽"
-   * （宽高比 > 画布）时 layoutWidth > W，offsetX = (W - layoutWidth)/2 变负 ——
+   * stageW 用的是舞台宽（预览舞台的实测宽度），画布比例由用户选的 export.aspect 决定。
+   * 两者比例一致时 layoutWidth 恰好等于 W；但仍有两条路径会让它溢出：
+   *   1. 舞台被窗口压窄（用户把窗口拖得非常窄），比例已经不是设置里的那个；
+   *   2. 舞台还没重排完就点了导出，读到的还是上一个比例的宽度。
+   * 这两种情况下 layoutWidth > W，offsetX = (W - layoutWidth)/2 为负 ——
    * 左右对齐的锚点会落到画布外，文字被裁掉一半。居中恰好被 layoutWidth/2 抵消，
    * 所以只有左右对齐暴露。
    * layoutWidth 本身**不能改**：换行宽度按预览等比才是换行位置正确的关键，
@@ -678,6 +682,15 @@ export function renderFrame({
    */
   const strokeCenter = strokeCfg.position === 'center'
 
+/**
+ * 逐字进度色。
+ *
+ * 与预览的 --lrc-color-char-progress 同一个设置项（settings.color.charProgress），
+ * 所以预览与导出必然同色 —— 不存在"预览蓝、导出绿"的可能。
+ * 兜底值与 settings.js 的默认值一致，设置缺省时观感不变。
+ */
+const charProgressColor = settings?.color?.charProgress ?? '#4c8dff'
+
   /**
    * 画一行的文字块（已换好的行数组），整体以 cy 为中心。
    * @param {any} row
@@ -685,7 +698,7 @@ export function renderFrame({
    * @param {string} fill 已算好的填充色
    * @param {number} scale
    */
-  function drawRow(row, cy, fill, scale) {
+  function drawRow(row, cy, fill, scale, charProgress = null) {
     const size = row.drawSize
     setFont(size)
 
@@ -777,6 +790,83 @@ export function renderFrame({
       }
     }
 
+
+    /*
+     * ── 逐字进度色：从左往右按进度覆盖 ──
+     *
+     * 【与预览的对应关系】
+     * 预览用 background-clip:text 的双层渐变（见 LyricLine.vue）。
+     * canvas 没有 background-clip，等价做法是：
+     *   裁剪出一个宽 = 文字宽度 × progress 的矩形，再重画一遍文字。
+     * 两者覆盖的都是「从行首到进度点的字形」，几何上等价。
+     *
+     * 【进度值必须来自同一个函数】
+     * charProgressAt 由调用方（StageView / 导出循环）算好后传进来，
+     * 这里不自己插值 —— 否则两处公式一旦漂移，预览与导出就对不上。
+     */
+    if (charProgress !== null && charProgress > 0 && parts.length > 0) {
+      const p = Math.min(1, Math.max(0, charProgress))
+
+      ctx.save()
+
+      /*
+       * 裁剪矩形覆盖整行文字的垂直范围。
+       * 高度取 size * lineHeight * total，并把多行换行的间距也算进去，
+       * 这样多行歌词也能被同一条竖线切齐。
+       */
+      const clipTop = cy - size * lineHeight * 1.2
+      const clipHeight = size * lineHeight * (total + 1.4)
+
+      // 逐行裁剪：每一行文字各自从它的起点量宽度，多行时进度按行分别应用
+      for (let j = 0; j < total; j++) {
+        const y = Number.isFinite(scale) && scale !== 1
+          ? (j - (total - 1) / 2) * size * lineHeight
+          : cy + (j - (total - 1) / 2) * size * lineHeight
+
+        const w = measureWidth(parts[j])
+        if (!(w > 0)) continue
+
+        ctx.beginPath()
+        ctx.rect(anchorX, clipTop, w * p, clipHeight)
+        ctx.clip()
+
+        /*
+         * 用进度色重画一遍。
+         * 描边顺序沿用 paint() 的既有约定（outer 先描后填 / center 先填后描），
+         * 否则进度段的描边会与未进度段呈现不同的内外比例。
+         */
+        ctx.fillStyle = charProgressColor
+        if (strokeOn) ctx.strokeStyle = strokeColor
+
+        if (Number.isFinite(scale) && scale !== 1) {
+          ctx.translate(anchorX, cy)
+          ctx.scale(scale, scale)
+          if (strokeOn && strokeCenter) {
+            ctx.fillText(parts[j], 0, y)
+            ctx.strokeText(parts[j], 0, y)
+          } else if (strokeOn) {
+            ctx.strokeText(parts[j], 0, y)
+            ctx.fillText(parts[j], 0, y)
+          } else {
+            ctx.fillText(parts[j], 0, y)
+          }
+          ctx.translate(-anchorX, -cy)
+          ctx.scale(1 / scale, 1 / scale)
+        } else {
+          if (strokeOn && strokeCenter) {
+            ctx.fillText(parts[j], anchorX, y)
+            ctx.strokeText(parts[j], anchorX, y)
+          } else if (strokeOn) {
+            ctx.strokeText(parts[j], anchorX, y)
+            ctx.fillText(parts[j], anchorX, y)
+          } else {
+            ctx.fillText(parts[j], anchorX, y)
+          }
+        }
+      }
+
+      ctx.restore()
+    }
     // 描边状态是 ctx 上的全局属性，不还原会污染下一行的绘制
     if (strokeOn) ctx.lineWidth = 0
   }
@@ -831,6 +921,23 @@ export function renderFrame({
   const scale = Number.isFinite(scaleCfg) && scaleCfg > 0 ? scaleCfg : 1.35
   // 减少动态效果时预览不做缩放（.reduce-motion .lyric-line.is-active { transform: none }）
   const effectiveScale = motion.reduceMotion ? 1 : scale
+  /**
+   * 第 i 行的逐字进度（0~1）；没有逐字时间返回 null。
+   *
+   * 【rows[i] 与 lines[i] 是一对一的】
+   * 上面的排版循环按 arr 顺序 push rows，没有合并或重排，
+   * 所以这里直接用 i 取 lines[i] 是安全的。
+   *
+   * 【与预览调用同一个函数】
+   * StageView.charProgressOf 也调 charProgressAt。同一个公式、同一个时间源，
+   * 预览与导出才谈得上几何一致。
+   */
+  function charProgressOf(i) {
+    const line = lines[i]
+    if (!line || !isCharTimed(line)) return null
+    return charProgressAt(line.chars, t)
+  }
+
 
   for (let i = 0; i < rows.length; i++) {
     const row = rows[i]
@@ -862,16 +969,16 @@ export function renderFrame({
        */
       const c = mixHex(normalColor, activeColor, trans.colorProg)
       const a = applyCssOpacityFactors(opacities[i], row, true, fadeOn)
-      drawRow(row, cy, rgbaOf(c, a), lerp(1, effectiveScale, trans.scaleProg))
+      drawRow(row, cy, rgbaOf(c, a), lerp(1, effectiveScale, trans.scaleProg), charProgressOf(i))
     } else if (isOutgoing) {
       // 上一行：颜色 active → normal，缩放 scale → 1
       const c = mixHex(activeColor, normalColor, trans.colorProg)
       const a = applyCssOpacityFactors(opacities[i], row, false, fadeOn)
-      drawRow(row, cy, rgbaOf(c, a), lerp(effectiveScale, 1, trans.scaleProg))
+      drawRow(row, cy, rgbaOf(c, a), lerp(effectiveScale, 1, trans.scaleProg), charProgressOf(i))
     } else {
       const alpha = applyCssOpacityFactors(opacities[i], row, false, fadeOn)
       if (!(alpha > 0)) continue
-      drawRow(row, cy, rgba(normalColor, alpha), 1)
+      drawRow(row, cy, rgba(normalColor, alpha), 1, charProgressOf(i))
     }
   }
 

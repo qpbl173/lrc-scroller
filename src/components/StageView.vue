@@ -27,10 +27,12 @@ import { useAutoScroll } from '@/composables/useAutoScroll'
 import { useTappingStore } from '@/stores/tappingStore'
 import { registerTappingAuto } from '@/composables/useTapping'
 import { registerAutoScroll, registerTapping } from '@/devtools/diagHooks'
-import { createFadeEngine } from '@/core/fade'
+import { buildLogicalRows, createFadeEngine } from '@/core/fade'
 import LyricLine from '@/components/LyricLine.vue'
+import { charProgressAt, isCharTimed } from '@/core/charProgress'
 import UntimedLine from '@/components/UntimedLine.vue'
 import LyricsInfoPanel from '@/components/LyricsInfoPanel.vue'
+import { DEFAULT_ASPECT, aspectCssValue, findAspect } from '@/core/settings'
 
 const lyrics = useLyricsStore()
 const player = usePlayerStore()
@@ -99,6 +101,34 @@ const hasLyrics = computed(() => lyrics.lines.length > 0)
  */
 const fadeEngine = createFadeEngine()
 
+/*
+ * 双语歌词的"放大"必须按逻辑行算，不能按物理行算。
+ *
+ * 【为什么】同时间的原文 + 翻译是**两个物理行**（各占一个 LyricLine），
+ * 而 activeIndex 只指向其中一个。若 :active 用 i === activeIndex 判定，
+ * 就变成"只有原文放大、翻译不动"，可 fade.js 早就规定双语算一行、
+ * 一起淡出。放大与淡出用两套口径，观感上就是断的。
+ *
+ * 这里直接复用 fade.js 的 buildLogicalRows —— 它正是按「时间相同」归并，
+ * 与淡出的口径完全一致，不另造一套判定。
+ */
+const logicalRowOf = computed(() => {
+  const lines = lyrics.lines
+  if (!Array.isArray(lines) || lines.length === 0) return null
+  return buildLogicalRows(lines).rowOf
+})
+
+/** 第 i 个物理行是否属于"当前逻辑行"（双语时原文与翻译同时成立） */
+function isActiveRow(i) {
+  if (i !== activeIndex.value) {
+    const rowOf = logicalRowOf.value
+    if (!rowOf) return false
+    if (activeIndex.value < 0 || i < 0) return false
+    return rowOf[i] === rowOf[activeIndex.value]
+  }
+  return true
+}
+
 const fadeConfig = computed(() => settings.settings.fade)
 
 /**
@@ -122,6 +152,25 @@ function opacityOf(index) {
   return Number.isFinite(v) ? v : null
 }
 
+/**
+ * 某一行的逐字进度（0~1），null 表示这行没有逐字时间。
+ *
+ * 【为什么在这里算，而不是每行自己读 playerStore】
+ * 播放时 currentTime 每帧都变。若每个 LyricLine 各自订阅，
+ * 一屏 20 行就是 20 个组件的更新；在父级算一次再分发，只有一个依赖。
+ *
+ * 【为什么用 charProgressAt 而不是自己插值】
+ * 导出侧（renderFrame）调的是同一个函数。两处共用一份公式，
+ * 才谈得上"预览几何 = 导出几何"。
+ * @param {number} i
+ * @returns {number|null}
+ */
+function charProgressOf(i) {
+  const line = lyrics.lines[i]
+  if (!line || !isCharTimed(line)) return null
+  return charProgressAt(line.chars, player.currentTime)
+}
+
 /*
   关于"快速拖动进度条时虚化状态立即跟上，不能滞后"：
 
@@ -143,6 +192,32 @@ function opacityOf(index) {
  */
 const padTopPx = computed(() => Math.round(containerHeight.value * settings.settings.layout.padTop))
 const padBottomPx = computed(() => Math.round(containerHeight.value * settings.settings.layout.padBottom))
+
+/**
+ * 画布比例适配（9:16 / 3:4 / 16:9）。
+ *
+ * 【比例必须落在 .stage 身上，而不是只落在外壳上】
+ * 导出的几何全部来自 .stage 的实测尺寸（core/stageGeometry 读的就是它），
+ * 如果只把外面那层做成竖屏、让 .stage 继续铺满宽屏区域，
+ * 预览看起来是竖版、导出的版心却按宽屏算 —— 换行与行高全部对不上。
+ * 所以外层 .stage-frame 只做"信箱底"（居中 + 留白上色），
+ * 真正的比例写在 .stage 上：这样 k = 画布高 / .stage 高，
+ * 比例一致时 k 在横竖两个方向上相同，导出与预览才是同一套几何。
+ *
+ * 尺寸怎么定（见下方 .stage-frame 的样式）：
+ *   width = min(可用宽, 可用高 × 比例)，高度由 aspect-ratio 反推。
+ * 两个方向同时确定，比例严格成立且永不溢出可用区域。
+ * 容器查询单位（cqw/cqh）拿到的正是"舞台可用区域" —— 它已经扣掉了
+ * 顶栏、播放条与抽屉避让，用 vw/vh 会算错。
+ */
+const aspectId = computed(() => settings.settings.export?.aspect ?? DEFAULT_ASPECT)
+const aspectRatioCss = computed(() => aspectCssValue(aspectId.value))
+const aspectLabel = computed(() => findAspect(aspectId.value).label)
+/** 宽 / 高 的纯数值（0.5625 这样的），CSS 的 min()/calc 里要用 */
+const aspectNum = computed(() => {
+  const p = findAspect(aspectId.value)
+  return p.width / p.height
+})
 
 /**
  * 需求 N1：无音频时用歌词时间轴作为模拟时钟时长。
@@ -198,6 +273,20 @@ onMounted(async () => {
 
 // 留白变化也要重新测量（否则几何缓存过期）
 watch([padTopPx, padBottomPx], async () => {
+  await new Promise((r) => requestAnimationFrame(r))
+  auto.measure()
+  if (!userScrolling.value) auto.snapToTarget()
+})
+
+/*
+ * 画布比例变化也要重新测量。
+ *
+ * ResizeObserver 虽然也会观察到 .stage 变窄变高，但它只在尺寸真正变化时触发；
+ * 比例切换的同一帧里 CSS 变量刚刚生效，缓存里的行宽/位移已经过期。
+ * 这里显式等一帧再量，和留白变化走同一条路径 —— 几何只有一个入口，
+ * 导出读到的也就永远是"当前比例下的真实几何"。
+ */
+watch(aspectId, async () => {
   await new Promise((r) => requestAnimationFrame(r))
   auto.measure()
   if (!userScrolling.value) auto.snapToTarget()
@@ -364,135 +453,241 @@ const showEmpty = computed(() => !hasLyrics.value && !showUntimed.value && !tapp
 </script>
 
 <template>
-  <section
-    ref="containerRef"
-    class="stage"
-    aria-label="歌词舞台"
-    tabindex="0"
-    @dragenter="onDragEnter"
-    @dragover.prevent
-    @dragleave="onDragLeave"
-    @drop="onDropInternal"
-    @wheel="onWheel"
-    @touchstart.passive="onTouchStart"
-    @touchmove="onTouchMove"
-    @keydown="onScrollKeydown"
+  <!--
+    外层只是"信箱底"：负责居中、给留白区域上色，本身不是被测量的舞台。
+    真舞台 .stage 居中放在里面，比例由 --stage-aspect 决定。
+    e2e 脚本与 .app-stage 的测量都不受影响（.stage 仍然只有一个）。
+  -->
+  <div
+    class="stage-frame"
+    :class="{ 'is-ratio-fit': aspectId !== DEFAULT_ASPECT }"
+    :style="{ '--stage-aspect': aspectRatioCss, '--stage-ratio': String(aspectNum) }"
+    :data-aspect="aspectId"
+    :data-aspect-label="aspectLabel"
   >
-    <LyricsInfoPanel />
+    <section
+      ref="containerRef"
+      class="stage"
+      aria-label="歌词舞台"
+      tabindex="0"
+      @dragenter="onDragEnter"
+      @dragover.prevent
+      @dragleave="onDragLeave"
+      @drop="onDropInternal"
+      @wheel="onWheel"
+      @touchstart.passive="onTouchStart"
+      @touchmove="onTouchMove"
+      @keydown="onScrollKeydown"
+    >
+      <LyricsInfoPanel />
 
-    <Transition name="toast">
-      <div v-if="dragging" class="stage__drop" aria-hidden="true">
-        <div class="stage__drop-inner">
-          <p class="stage__drop-title">{{ importing ? '正在解析…' : '松开即可导入' }}</p>
-          <p class="stage__drop-hint">支持音频与 .lrc / .txt 歌词，全程本地处理，不会上传</p>
-        </div>
-      </div>
-    </Transition>
-
-    <div v-if="showEmpty" class="stage__empty">
-      <p class="stage__empty-title">还没有歌词</p>
-      <p class="stage__empty-hint">把 .lrc 文件拖到这里，或点击顶部「导入 LRC」。</p>
-      <div class="stage__empty-actions">
-        <button class="btn btn--primary" type="button" @click="pickDemo">载入内置示例</button>
-      </div>
-      <p v-if="lyrics.droppedLines.length" class="stage__empty-note">
-        这份文件里有 {{ lyrics.droppedLines.length }} 行文本没有时间标签，因此无法滚动同步。
-        可在阶段 5 的快速打轴模式中补时间。
-      </p>
-    </div>
-
-    <template v-else>
-      <!-- 轨道：唯一被 translate3d 移动的元素 -->
-      <div v-if="hasLyrics" ref="trackRef" class="stage__track" :class="{ 'is-masked': isTappingUntimed }">
-        <!--
-          上下留白占位块（像素高度，由舞台高度 × 用户比例算出）。
-          它们让"首行/末行也能停在容器中心"成为可能；
-          测量时会被跳过（measure() 只取带 data-line-index 的元素）。
-        -->
-        <div class="stage__pad" :style="{ height: `${padTopPx}px` }" aria-hidden="true" />
-
-        <LyricLine
-          v-for="(line, i) in lyrics.lines"
-          :key="line.id"
-          :line="line"
-          :index="i"
-          :active="i === activeIndex"
-          :past="activeIndex >= 0 && i < activeIndex"
-          :editing="isTappingLines && i === tapping.editingIndex"
-          :tapped="isTappingLines && i === tapping.lastTappedIndex"
-          :opacity="opacityOf(i)"
-        />
-
-        <div class="stage__pad" :style="{ height: `${padBottomPx}px` }" aria-hidden="true" />
-      </div>
-
-      <!--
-        N3 · 无时间标签的文本行。
-        刻意放在轨道**之后**、且**不带 data-line-index**：
-          - 不在轨道内 → 不会被 translate3d 搬动，也不进入 rowMetrics；
-          - 不带 data-line-index → 即便将来有人移动了 DOM，也不会被 measure() 误收。
-        它们不参与播放定位（没有时间，无法计算 activeIndex），只做静态铺开。
-      -->
-      <div
-        v-if="showUntimed"
-        class="stage__untimed"
-        :class="{ 'is-tapping': isTappingUntimed }"
-        data-testid="untimed-rows"
-      >
-        <!--
-          标题在打轴模式下变成进度指示。
-          原来的"N 行文本没有时间标签"是**说明**，
-          打轴时用户需要的是**进度**（打到第几行了）。
-        -->
-        <p class="stage__untimed-head">
-          <template v-if="isTappingUntimed">
-            打轴中 · 第 {{ tapping.editingIndex + 1 }}/{{ tapping.totalCount }} 行
-            <span class="stage__untimed-hint">空格打点 · ←/→ 微调 · Z 撤销</span>
-          </template>
-          <template v-else>{{ untimedRows.length }} 行文本没有时间标签</template>
-        </p>
-        <div class="stage__untimed-body">
-          <UntimedLine
-            v-for="(row, i) in untimedRows"
-            :key="`u-${row.line}-${i}`"
-            :row="row"
-            :index="i"
-            :editing="isTappingUntimed && i === tapping.editingIndex"
-            :tapped="isTappingUntimed && i === tapping.lastTappedIndex"
-          />
-        </div>
-      </div>
-
-      <!-- 回看提示：用户滚走后提供一键回到当前行 -->
       <Transition name="toast">
-        <button
-          v-if="userScrolling || activeOffscreen"
-          class="stage__resume"
-          type="button"
-          @click="auto.resumeFollow()"
-        >
-          <span class="stage__resume-dot" aria-hidden="true" />
-          回到当前行
-        </button>
+        <div v-if="dragging" class="stage__drop" aria-hidden="true">
+          <div class="stage__drop-inner">
+            <p class="stage__drop-title">{{ importing ? '正在解析…' : '松开即可导入' }}</p>
+            <p class="stage__drop-hint">支持音频与 .lrc / .txt 歌词，全程本地处理，不会上传</p>
+          </div>
+        </div>
       </Transition>
-    </template>
-  </section>
+
+      <div v-if="showEmpty" class="stage__empty">
+        <p class="stage__empty-title">还没有歌词</p>
+        <p class="stage__empty-hint">把 .lrc 文件拖到这里，或点击顶部「导入 LRC」。</p>
+        <div class="stage__empty-actions">
+          <button class="btn btn--primary" type="button" @click="pickDemo">载入内置示例</button>
+        </div>
+        <p v-if="lyrics.droppedLines.length" class="stage__empty-note">
+          这份文件里有 {{ lyrics.droppedLines.length }} 行文本没有时间标签，因此无法滚动同步。
+          可在阶段 5 的快速打轴模式中补时间。
+        </p>
+      </div>
+
+      <template v-else>
+        <!-- 轨道：唯一被 translate3d 移动的元素 -->
+        <div v-if="hasLyrics" ref="trackRef" class="stage__track" :class="{ 'is-masked': isTappingUntimed }">
+          <!--
+            上下留白占位块（像素高度，由舞台高度 × 用户比例算出）。
+            它们让"首行/末行也能停在容器中心"成为可能；
+            测量时会被跳过（measure() 只取带 data-line-index 的元素）。
+          -->
+          <div class="stage__pad" :style="{ height: `${padTopPx}px` }" aria-hidden="true" />
+
+          <LyricLine
+            v-for="(line, i) in lyrics.lines"
+            :key="line.id"
+            :line="line"
+            :index="i"
+            :active="isActiveRow(i)"
+            :past="activeIndex >= 0 && i < activeIndex"
+            :editing="isTappingLines && i === tapping.editingIndex"
+            :tapped="isTappingLines && i === tapping.lastTappedIndex"
+            :opacity="opacityOf(i)"
+            :char-progress="charProgressOf(i)"
+          />
+
+          <div class="stage__pad" :style="{ height: `${padBottomPx}px` }" aria-hidden="true" />
+        </div>
+
+        <!--
+          N3 · 无时间标签的文本行。
+          刻意放在轨道**之后**、且**不带 data-line-index**：
+            - 不在轨道内 → 不会被 translate3d 搬动，也不进入 rowMetrics；
+            - 不带 data-line-index → 即便将来有人移动了 DOM，也不会被 measure() 误收。
+          它们不参与播放定位（没有时间，无法计算 activeIndex），只做静态铺开。
+        -->
+        <div
+          v-if="showUntimed"
+          class="stage__untimed"
+          :class="{ 'is-tapping': isTappingUntimed }"
+          data-testid="untimed-rows"
+        >
+          <!--
+            标题在打轴模式下变成进度指示。
+            原来的"N 行文本没有时间标签"是**说明**，
+            打轴时用户需要的是**进度**（打到第几行了）。
+          -->
+          <p class="stage__untimed-head">
+            <template v-if="isTappingUntimed">
+              打轴中 · 第 {{ tapping.editingIndex + 1 }}/{{ tapping.totalCount }} 行
+              <span class="stage__untimed-hint">空格打点 · ←/→ 微调 · Z 撤销</span>
+            </template>
+            <template v-else>{{ untimedRows.length }} 行文本没有时间标签</template>
+          </p>
+          <div class="stage__untimed-body">
+            <UntimedLine
+              v-for="(row, i) in untimedRows"
+              :key="`u-${row.line}-${i}`"
+              :row="row"
+              :index="i"
+              :editing="isTappingUntimed && i === tapping.editingIndex"
+              :tapped="isTappingUntimed && i === tapping.lastTappedIndex"
+            />
+          </div>
+        </div>
+
+        <!-- 回看提示：用户滚走后提供一键回到当前行 -->
+        <Transition name="toast">
+          <button
+            v-if="userScrolling || activeOffscreen"
+            class="stage__resume"
+            type="button"
+            @click="auto.resumeFollow()"
+          >
+            <span class="stage__resume-dot" aria-hidden="true" />
+            回到当前行
+          </button>
+        </Transition>
+      </template>
+    </section>
+  </div>
 </template>
 
 <style scoped>
+/*
+ * 信箱底：整块可用区域的背景 —— 也就是导出画面**之外**的部分。
+ *
+ * 这里铺棋盘格而不是沿用 --lrc-bg，是为了让画布边界在视觉上明确可辨：
+ * 竖版时两侧留白若与舞台同色，用户无法一眼看出哪部分会进导出，
+ * 容易误判行宽（看着像放得下，其实已超出画布）。
+ *
+ * 棋盘画在 --lrc-bg 之上（background-image 叠加在 background-color 上），
+ * 两格都用半透明色：用户改歌词背景色时棋盘随底色一起变，
+ * 而不会像不透明棋盘那样把背景整个盖掉，制造出背景改了却看不出的假象。
+ */
+.stage-frame {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+  background-image: repeating-conic-gradient(
+    var(--checker-a) 0% 25%,
+    var(--checker-b) 0% 50%
+  );
+  /* 一个视觉格子 = --checker-size。repeating-conic-gradient 的 50% 只走半格，
+     故背景尺寸取两倍，最终格边长才等于 --checker-size。 */
+  background-size: calc(var(--checker-size) * 2) calc(var(--checker-size) * 2);
+  background-color: var(--lrc-bg);
+  transition: background-color var(--lrc-fade) ease;
+  /*
+   * 让内部可以用 cq 单位按"这块区域的实际尺寸"算舞台宽高。
+   * 用 vw/vh 不行：可用区域还要减掉顶栏、播放条，以及抽屉打开时的避让。
+   */
+  container-type: size;
+}
+
 .stage {
   position: relative;
+  /*
+   * width:100% 是必须写出来的：.stage-frame 是 flex 容器，
+   * 不写的话舞台会按内容收缩（横屏时右侧突然多出一条背景带），
+   * 只有竖版那条 ratio-fit 规则才该覆盖它。
+   */
+  width: 100%;
   height: 100%;
   overflow: hidden; /* 滚动由 transform 接管，不使用原生滚动 */
   background: var(--lrc-bg);
   transition: background var(--lrc-fade) ease;
   /* 可聚焦以支持键盘滚动，但鼠标用户不该看到焦点框 */
   outline: none;
+  flex: none;
+}
+
+/*
+ * 竖版 / 3:4：舞台收窄成目标比例并居中。
+ *
+ * 16:9 不套这条规则 —— 横屏时舞台就该铺满（那是历史行为，
+ * 窗口比例千变万化，强行锁 16:9 只会平白损失可视面积）。
+ * 竖版则必须锁死比例：9:16 的换行位置和横屏完全不同，
+ * 不锁的话"预览里一行放得下、导出里放不下"。
+ *
+ * 宽度取"可用宽"与"可用高 × 比例"的较小值，高度由 aspect-ratio 反推。
+ * 这样两个方向同时被确定，且永远不会溢出可用区域（等比收缩，不留畸变）。
+ * 用 cq 单位而不是 vw/vh：可用区域已经扣掉了顶栏、播放条与抽屉避让。
+ */
+.stage-frame.is-ratio-fit .stage {
+  /*
+   * 兜底（浏览器不支持 cq 单位时）：宽度铺满、高度按比例反推。
+   * 刻意不加 max-height —— 一旦同时给"确定高度 + 最大高度 + aspect-ratio"，
+   * 浏览器会遵守 max-height 而丢弃比例，画面被压扁。
+   * 宁可让 .stage-frame 的 overflow:hidden 裁掉一点底部：比例仍是准的，
+   * 量化出来的几何也仍然与导出同源，只是预览少看几行。
+   */
+  width: 100%;
+  height: auto;
+  max-width: 100%;
+  aspect-ratio: var(--stage-aspect);
+}
+
+@supports (width: 1cqw) {
+  .stage-frame.is-ratio-fit .stage {
+    width: min(100cqw, calc(100cqh * var(--stage-ratio)));
+    height: auto;
+    max-width: none;
+  }
 }
 
 .stage:focus-visible {
   outline: 2px solid var(--ui-accent);
   outline-offset: -2px;
+}
+
+/*
+ * 只在舞台被收窄成目标比例时画这条边界线 —— 它就是导出画面的真实边界。
+ * 16:9 铺满时不画：此时边界与窗口重合，描边只是无意义的框。
+ *
+ * 刻意用 box-shadow 而不是 border / outline：
+ *   · border 参与盒模型，会让 stageGeometry 量到的宽高少 2px，
+ *     缩放系数随之算错，破坏"预览几何 = 导出几何"这条核心契约；
+ *   · outline 会被下面 .stage:focus-visible 的焦点框整条覆盖，
+ *     而舞台是 tabindex="0"，键盘用户一聚焦就看不到画布边界了。
+ * box-shadow 既不占布局，也不受 outline 覆盖影响。
+ */
+.stage-frame.is-ratio-fit .stage {
+  box-shadow: 0 0 0 1px rgb(255 255 255 / 22%);
 }
 
 /* 轨道：唯一被 transform 的元素 */

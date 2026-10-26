@@ -22,6 +22,14 @@ export const useLyricsStore = defineStore('lyrics', {
     return {
       /** @type {import('@/core/lrcParser').LyricLine[]} */
       lines: demo.lines,
+      /**
+       * 双语组里放大哪一行：auto（按内容判断）| top（放大上行）| bottom（放大下行）
+       *
+       * 【为什么只改 isTranslation 而不是改渲染】
+       * isTranslation 同时驱动预览（LyricLine 的 CSS）与导出（renderFrame 的字号），
+       * 两处读同一份行数据 —— 改它，预览与导出必然一致。
+       */
+      primaryMode: 'auto',
       meta: demo.meta,
       /** @type {Array<{code:string,level:string,message:string,hint?:string,detail?:string}>} */
       warnings: demo.warnings,
@@ -73,6 +81,7 @@ export const useLyricsStore = defineStore('lyrics', {
      */
     loadDoc(doc, info = {}) {
       this.lines = doc.lines
+      this.applyPrimaryMode()
       this.meta = doc.meta
       this.warnings = doc.warnings
       this.droppedLines = doc.droppedLines
@@ -111,11 +120,11 @@ export const useLyricsStore = defineStore('lyrics', {
       this.meta = { ...this.meta, offsetMs: ms }
       const { lines } = withOffset(this.lines, ms)
       this.lines = lines
+      this.applyPrimaryMode()
 
       // offset 变化可能产生新的重复时间或负数行，重算相关警告
       this.refreshWarnings()
     },
-
     /**
      * 重算与 offset 相关的警告（重复时间、负数时间）。
      * 元数据类警告（编码、无时间标签）不在此处处理，它们不随 offset 变化。
@@ -147,6 +156,95 @@ export const useLyricsStore = defineStore('lyrics', {
 
       // 恢复成"元数据警告在前、offset 相关警告在后"的稳定顺序
       this.warnings = [...keep]
+    },
+
+    /**
+     * 一键调换双语歌词的上下行。
+     *
+     * 【做法】把同一时间（同一逻辑行）内的各行**正文互换**，
+     * 然后重新走一遍 offset 重算 —— 主行/翻译的判定由 pickPrimaryLine 重做，
+     * 不额外存任何"是否已调换"的开关状态。
+     *
+     * 【为什么不交换数组位置】
+     * 交换位置会被 withOffset 的稳定排序（按 sourceLine）打回原样；
+     * 而互换 text 不会 —— sourceLine 只是排序依据，正文才是用户看到的东西。
+     * 这也让"调换"是纯粹的数据变换，预览与导出读同一份 text，天然一致。
+     */
+    swapBilingualLines() {
+      const groups = []
+      let i = 0
+      while (i < this.lines.length) {
+        let j = i
+        while (j < this.lines.length && this.lines[j].t === this.lines[i].t) j++
+        if (j - i > 1) groups.push([i, j])
+        i = j
+      }
+
+      // 只处理真正的双语组：有翻译标记，或至少两行非空
+      const targets = groups.filter(([a, b]) => {
+        const seg = this.lines.slice(a, b)
+        return seg.filter((l) => !l.empty).length >= 2
+      })
+      if (targets.length === 0) return 0
+
+      const next = this.lines.map((l) => ({ ...l }))
+      for (const [a, b] of targets) {
+        const seg = next.slice(a, b)
+        const texts = seg.map((l) => l.text)
+        const charsList = seg.map((l) => l.chars)
+        // 倒序回填：两行互换，三行以上则整体倒转
+        for (let k = 0; k < seg.length; k++) {
+          seg[k].text = texts[texts.length - 1 - k]
+          seg[k].chars = charsList[charsList.length - 1 - k]
+        }
+      }
+
+      this.lines = next
+      // 重算 isTranslation / duplicateOf，并让警告跟着更新
+      this.setOffset(this.meta.offsetMs ?? 0)
+      return targets.length
+    },
+
+    /**
+     * 按 primaryMode 决定双语组里放大哪一行。
+     *
+     * 只改 isTranslation —— 它是"谁是次要行"的唯一真值，
+     * 预览的 CSS 与导出的字号都读它，所以改一处两边同步。
+     *
+     * auto   ：沿用解析器的内容判断（含中日韩文字优先），不动 isTranslation
+     * top    ：每组的第一行放大，其余为翻译
+     * bottom ：每组的最后一行放大，其余为翻译
+     */
+    applyPrimaryMode() {
+      const mode = this.primaryMode || 'auto'
+      if (mode === 'auto') return
+
+      const lines = this.lines
+      let i = 0
+      while (i < lines.length) {
+        let j = i
+        while (j < lines.length && lines[j].t === lines[i].t) j++
+        if (j - i > 1) {
+          const seg = lines.slice(i, j)
+          const nonEmpty = seg.filter((l) => !l.empty)
+          if (nonEmpty.length >= 2) {
+            const primary = mode === 'top' ? seg[0] : seg[seg.length - 1]
+            for (const line of seg) line.isTranslation = line !== primary
+          }
+        }
+        i = j
+      }
+    },
+
+    /**
+     * 设置双语组的放大方式，并立刻重算。
+     * @param {"auto"|"top"|"bottom"} mode
+     */
+    setPrimaryMode(mode) {
+      this.primaryMode = mode === 'top' || mode === 'bottom' ? mode : 'auto'
+      // auto 要交回解析器的内容判断：重走一遍 offset 重算即可
+      if (this.primaryMode === 'auto') this.setOffset(this.meta.offsetMs ?? 0)
+      else this.applyPrimaryMode()
     },
 
     /** 找时间重复的分组（store 内用，逻辑与 parser 保持一致）。 */

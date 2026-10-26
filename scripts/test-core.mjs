@@ -27,13 +27,28 @@ import {
   pickEnum,
   RESOLUTION_PRESETS,
   FPS_PRESETS,
+  ASPECT_PRESETS,
+  DEFAULT_ASPECT,
+  FIELD_META,
   findResolution,
+  findAspect,
+  aspectOfSize,
+  aspectCssValue,
+  resolutionPresetsFor,
   nearestResolutionId,
   resolveFontFamily,
   resolveStrokeColor,
 } from '../src/core/settings.js'
 import { makeMessage, fromError, CODES } from '../src/core/errors.js'
-import { parseLrc, withOffset, reapplyOffset } from '../src/core/lrcParser.js'
+import {
+  parseLrc,
+  withOffset,
+  reapplyOffset,
+  splitEnhancedSegments,
+  toChars,
+  offsetChars,
+  countInvalidEnhancedTags,
+} from '../src/core/lrcParser.js'
 import { decodeLrcBuffer, looksGarbled, isEncodingSupported } from '../src/core/encoding.js'
 import {
   createSimClock,
@@ -163,7 +178,31 @@ import {
   DEFAULT_LRC_BASE,
   LRC_EXT,
   MAX_BASE_LENGTH,
+  buildLrcDual,
+  hasAnyChars,
 } from '../src/core/lrcWriter.js'
+import {
+  charProgressAt,
+  isCharTimed,
+  splitChars,
+  isTappableChar,
+  charTapRefusal,
+  createCharTapState,
+  charTapStep,
+  charUndoStep,
+  charRelocateCursor,
+  fnv1a,
+  charDraftTextHash,
+  serializeCharState,
+  parseCharState,
+  hydrateCharDraft,
+  alignSavedDrafts,
+  countTimedChars,
+  CHAR_STORAGE_KEY,
+  CHAR_UNDO_LIMIT,
+  CHAR_PROGRESS_MODES,
+  DEFAULT_CHAR_PROGRESS_MODE,
+} from '../src/core/charProgress.js'
 
 let passed = 0
 let failed = 0
@@ -3184,10 +3223,20 @@ function makeProbeCanvas(w, h) {
     clearRect() {
       ops.push({ op: 'clearRect' })
     },
-    fillRect() {
+    fillRect(x, y, w, h) {
       // 记录"铺背景"那一刻的颜色 —— 之后 fillText 会覆盖 ctx.fillStyle，
       // 事后读 ctx.fillStyle 拿到的是文字的填充色，不是背景色。
-      ops.push({ op: 'fillRect', fillStyle: String(this.fillStyle) })
+      // 宽高也记下来：竖版画布必须整幅铺满，补边逻辑改坏了这里能立刻发现。
+      ops.push({ op: 'fillRect', x, y, w, h, fillStyle: String(this.fillStyle) })
+    },
+    beginPath() {
+      ops.push({ op: 'beginPath' })
+    },
+    rect(x, y, w, h) {
+      ops.push({ op: 'rect', x, y, w, h })
+    },
+    clip() {
+      ops.push({ op: 'clip' })
     },
     save() {
       ops.push({ op: 'save' })
@@ -3502,10 +3551,104 @@ test('分辨率预设覆盖 480p / 720p / 1080p / 2K / 4K', () => {
   )
 })
 
-test('所有分辨率预设都是 16:9', () => {
+test('16:9 分辨率预设都是 16:9（历史尺寸不能被改）', () => {
   for (const p of RESOLUTION_PRESETS) {
     assert.ok(Math.abs(p.width / p.height - 16 / 9) < 0.01, `${p.id} 不是 16:9：${p.width}x${p.height}`)
   }
+  // 这五个尺寸是已发布版本产出的成品尺寸，改了会让老设置的导出悄悄变形
+  assert.deepEqual(
+    RESOLUTION_PRESETS.map((p) => `${p.width}x${p.height}`),
+    ['854x480', '1280x720', '1920x1080', '2560x1440', '3840x2160'],
+  )
+})
+
+test('画布比例预设包含 16:9 / 9:16 / 3:4，默认 16:9', () => {
+  assert.deepEqual(
+    ASPECT_PRESETS.map((p) => p.id),
+    ['16:9', '9:16', '3:4'],
+  )
+  assert.equal(DEFAULT_ASPECT, '16:9')
+  assert.equal(ASPECT_PRESETS[0].id, DEFAULT_ASPECT)
+  for (const a of ASPECT_PRESETS) {
+    assert.ok(a.label.length > 0, `${a.id} 缺 label`)
+    assert.ok(a.width > 0 && a.height > 0, `${a.id} 的宽高必须是正数`)
+  }
+})
+
+test('findAspect：未知 id 回落 16:9（不返回 undefined）', () => {
+  assert.equal(findAspect('9:16').id, '9:16')
+  assert.equal(findAspect('3:4').id, '3:4')
+  assert.equal(findAspect('nope').id, '16:9')
+  assert.equal(findAspect(undefined).id, '16:9')
+  assert.equal(findAspect(null).id, '16:9')
+})
+
+test('resolutionPresetsFor：每个比例都有 5 档，且比例严格等于声明值', () => {
+  for (const a of ASPECT_PRESETS) {
+    const list = resolutionPresetsFor(a.id)
+    assert.equal(list.length, 5, `${a.id} 档位数量不对`)
+    assert.deepEqual(
+      list.map((p) => p.id),
+      ['480p', '720p', '1080p', '2k', '4k'],
+    )
+    for (const p of list) {
+      const ratio = p.width / p.height
+      const want = a.width / a.height
+      // 竖版的短边固定，长边会做 4 的倍数取整，允许 1% 的偏差
+      assert.ok(
+        Math.abs(ratio - want) / want < 0.01,
+        `${a.id} 的 ${p.id} 比例不对：${p.width}x${p.height}`,
+      )
+      assert.equal(p.aspect, a.id)
+    }
+  }
+})
+
+test('竖版分辨率按短边命名：9:16 的 1080p 是 1080x1920', () => {
+  const p = findResolution('1080p', '9:16')
+  assert.equal(p.width, 1080)
+  assert.equal(p.height, 1920)
+  // 同一个 id 在别的比例下尺寸不同 —— 这正是"必须同时传比例"的原因
+  assert.equal(findResolution('1080p', '16:9').width, 1920)
+  assert.equal(findResolution('1080p', '3:4').height, 1440)
+})
+
+test('竖版尺寸都是 4 的倍数（H.264 编码器友好）', () => {
+  for (const id of ['9:16', '3:4']) {
+    for (const p of resolutionPresetsFor(id)) {
+      assert.equal(p.width % 4, 0, `${id} ${p.id} 宽不是 4 的倍数：${p.width}`)
+      assert.equal(p.height % 4, 0, `${id} ${p.id} 高不是 4 的倍数：${p.height}`)
+    }
+  }
+})
+
+test('4K 竖版的边长不超过 FIELD_META 的存值上限', () => {
+  for (const id of ['9:16', '3:4']) {
+    for (const p of resolutionPresetsFor(id)) {
+      assert.ok(p.width <= FIELD_META['export.width'].max, `${p.width} 超出存值上限`)
+      assert.ok(p.height <= FIELD_META['export.height'].max, `${p.height} 超出存值上限`)
+      assert.ok(p.width >= FIELD_META['export.width'].min)
+      assert.ok(p.height >= FIELD_META['export.height'].min)
+    }
+  }
+})
+
+test('aspectOfSize：按尺寸反查比例（含 4 的倍数取整误差）', () => {
+  assert.equal(aspectOfSize(1920, 1080), '16:9')
+  assert.equal(aspectOfSize(1080, 1920), '9:16')
+  assert.equal(aspectOfSize(1080, 1440), '3:4')
+  // 480p 竖版取整后是 480x852，比例偏差 0.16%，仍应认出 9:16
+  assert.equal(aspectOfSize(480, 852), '9:16')
+  assert.equal(aspectOfSize(0, 0), '16:9')
+  assert.equal(aspectOfSize(NaN, 100), '16:9')
+})
+
+test('aspectCssValue：产出 aspect-ratio 能直接吃的值', () => {
+  assert.equal(aspectCssValue('16:9'), '16 / 9')
+  assert.equal(aspectCssValue('9:16'), '9 / 16')
+  assert.equal(aspectCssValue('3:4'), '3 / 4')
+  // 未知比例回落到默认，绝不返回 'undefined / undefined'
+  assert.equal(aspectCssValue('nope'), '16 / 9')
 })
 
 test('帧率预设包含 24 / 30 / 60', () => {
@@ -3519,6 +3662,10 @@ test('findResolution：未知 id 回落 720p（不返回 undefined）', () => {
   assert.equal(findResolution('nope').id, '720p')
   assert.equal(findResolution(undefined).id, '720p')
   assert.equal(findResolution('4k').height, 2160)
+  // 不传比例时按 16:9 查，保持老调用方的行为不变
+  assert.equal(findResolution('4k').width, 3840)
+  // 竖版里未知 id 也回落该比例的 720p，而不是横版的
+  assert.equal(findResolution('nope', '9:16').width, 720)
 })
 
 test('nearestResolutionId：按画布尺寸反查最接近的预设', () => {
@@ -3526,11 +3673,19 @@ test('nearestResolutionId：按画布尺寸反查最接近的预设', () => {
   assert.equal(nearestResolutionId(1920, 1080), '1080p')
   assert.equal(nearestResolutionId(3840, 2160), '4k')
   assert.equal(nearestResolutionId(NaN, NaN), '720p')
+  // 竖版按短边反查：1080x1920 应认出 1080p，而不是按高度匹配到 2K
+  assert.equal(nearestResolutionId(1080, 1920), '1080p')
+  assert.equal(nearestResolutionId(1080, 1440), '1080p')
 })
 
-test('默认设置带 export.resolution 且合法', () => {
+test('默认设置带 export.aspect / export.resolution 且合法', () => {
   const d = createDefaultSettings()
+  assert.equal(d.export.aspect, '16:9')
   assert.equal(d.export.resolution, '720p')
+  // 默认组合必须能查出真实尺寸，不能是 undefined
+  const p = findResolution(d.export.resolution, d.export.aspect)
+  assert.equal(p.width, 1280)
+  assert.equal(p.height, 720)
 })
 
 test('export.resolution 脏数据回落默认', () => {
@@ -3544,14 +3699,155 @@ test('export.resolution 合法值被保留（用户选择能持久化）', () =>
   assert.equal(sanitizeSettings({ export: { resolution: '480p' } }).export.resolution, '480p')
 })
 
+test('export.aspect 脏数据回落 16:9，合法值被保留', () => {
+  assert.equal(sanitizeSettings({}).export.aspect, '16:9')
+  assert.equal(sanitizeSettings({ export: { aspect: '1:1' } }).export.aspect, '16:9')
+  assert.equal(sanitizeSettings({ export: { aspect: 9 } }).export.aspect, '16:9')
+  assert.equal(sanitizeSettings({ export: { aspect: '9:16' } }).export.aspect, '9:16')
+  assert.equal(sanitizeSettings({ export: { aspect: '3:4' } }).export.aspect, '3:4')
+})
+
+test('比例与分辨率可以独立持久化（组合都合法）', () => {
+  for (const aspect of ['16:9', '9:16', '3:4']) {
+    for (const resolution of ['480p', '720p', '1080p', '2k', '4k']) {
+      const s = sanitizeSettings({ export: { aspect, resolution } })
+      assert.equal(s.export.aspect, aspect)
+      assert.equal(s.export.resolution, resolution)
+      const p = findResolution(s.export.resolution, s.export.aspect)
+      assert.ok(p.width > 0 && p.height > 0, `${aspect} ${resolution} 查不出尺寸`)
+    }
+  }
+})
+
+// ─────────────────────────────────────────────
+group('settings · 竖版画布与预览等比（导出=预览）')
+
+test('比例一致时版心宽度正好等于画布宽度（不留补边）', () => {
+  for (const aspect of ASPECT_PRESETS) {
+    // 模拟预览舞台：高度 600，宽度按比例换算（与 .stage 的 aspect-ratio 一致）
+    const stageH = 600
+    const stageW = (stageH * aspect.width) / aspect.height
+    for (const preset of resolutionPresetsFor(aspect.id)) {
+      const probe = makeProbeCanvas(preset.width, preset.height)
+      const s = createDefaultSettings()
+      s.layout.align = 'left'
+      renderFrame({
+        lineIndex: 0,
+        lines: [{ t: 0, text: '一行歌词', empty: false }],
+        settings: s,
+        t: 0,
+        canvas: probe.canvas,
+        scrollOffset: 0,
+        referenceHeight: stageH,
+        referenceWidth: stageW,
+      })
+      const txt = probe.texts()[0]
+      assert.ok(txt, `${aspect.id} ${preset.id} 没画出文字`)
+      // 左对齐时锚点 x = offsetX = (W - layoutWidth) / 2，比例一致就该是 0
+      assert.ok(
+        Math.abs(txt.x) < 0.51,
+        `${aspect.id} ${preset.id} 出现横向补边：x=${txt.x}（版心未铺满）`,
+      )
+    }
+  }
+})
+
+test('竖版画布下文字始终落在画布内（不会被裁掉）', () => {
+  for (const aspect of ASPECT_PRESETS) {
+    const stageH = 700
+    const stageW = (stageH * aspect.width) / aspect.height
+    for (const align of ['left', 'center', 'right']) {
+      const preset = findResolution('1080p', aspect.id)
+      const probe = makeProbeCanvas(preset.width, preset.height)
+      const s = createDefaultSettings()
+      s.layout.align = align
+      renderFrame({
+        lineIndex: 0,
+        lines: [{ t: 0, text: '一句比较长的歌词用来测试换行与锚点', empty: false }],
+        settings: s,
+        t: 0,
+        canvas: probe.canvas,
+        scrollOffset: 0,
+        referenceHeight: stageH,
+        referenceWidth: stageW,
+      })
+      for (const txt of probe.texts()) {
+        assert.ok(Number.isFinite(txt.x), `${aspect.id}/${align} 的 x 不是有限数`)
+        assert.ok(
+          txt.x >= -1 && txt.x <= preset.width + 1,
+          `${aspect.id}/${align} 的锚点跑到画布外：${txt.x}`,
+        )
+      }
+    }
+  }
+})
+
+test('缩放系数只由"画布高 / 舞台高"决定，与画布宽高比无关', () => {
+  /*
+   * 同一个画布高度（1080）下，三种比例的 k 必须完全相同 ——
+   * renderFrame 用 scaleFactor(H, referenceHeight)，压根不看宽度。
+   * 这条断言守住"横竖版不会各自长出一套缩放逻辑"：
+   * 一旦有人把 k 改成 min(W/refW, H/refH) 之类的写法，这里立刻报错。
+   */
+  const sizes = []
+  const stageH = 600
+  for (const aspect of ASPECT_PRESETS) {
+    const stageW = (stageH * aspect.width) / aspect.height
+    const canvasW = Math.round((1080 * aspect.width) / aspect.height)
+    const probe = makeProbeCanvas(canvasW, 1080)
+    const s = createDefaultSettings()
+    renderFrame({
+      lineIndex: 0,
+      lines: [{ t: 0, text: '文字', empty: false }],
+      settings: s,
+      t: 0,
+      canvas: probe.canvas,
+      scrollOffset: 0,
+      referenceHeight: stageH,
+      referenceWidth: stageW,
+    })
+    const font = probe.texts()[0].font
+    sizes.push(Number(font.match(/(\d+(?:\.\d+)?)px/)[1]))
+  }
+  assert.ok(
+    Math.max(...sizes) - Math.min(...sizes) < 1e-6,
+    `三种比例在同样画布高度下字号应一致，实际 ${JSON.stringify(sizes)}`,
+  )
+  // 具体数值也要对得上：40px × (1080 / 600)
+  assert.ok(Math.abs(sizes[0] - 40 * (1080 / 600)) < 1e-6, `字号应为 72，实际 ${sizes[0]}`)
+})
+
+test('竖版画布背景被完整铺满（含留白区域）', () => {
+  const preset = findResolution('1080p', '9:16')
+  const probe = makeProbeCanvas(preset.width, preset.height)
+  const s = createDefaultSettings()
+  renderFrame({
+    lineIndex: 0,
+    lines: [{ t: 0, text: '文字', empty: false }],
+    settings: s,
+    t: 0,
+    canvas: probe.canvas,
+    scrollOffset: 0,
+    referenceHeight: 600,
+    referenceWidth: (600 * 9) / 16,
+  })
+  const fills = probe.ops.filter((o) => o.op === 'fillRect')
+  const first = fills[0]
+  assert.ok(first, '应有背景填充操作')
+  assert.equal(first.w, preset.width)
+  assert.equal(first.h, preset.height)
+  assert.equal(first.x, 0)
+  assert.equal(first.y, 0)
+})
+
 // ─────────────────────────────────────────────
 group('tutorial · 步骤表与推进（新手教程）')
 
-test('教程共 4 步，顺序为 导入 → 打轴 → 设置 → 导出', () => {
-  assert.equal(stepCount(), 4)
+test('教程共 5 步，顺序为 导入 → 打轴 → 双语 → 设置 → 导出', () => {
+  assert.equal(stepCount(), 5)
   assert.deepEqual(
     TUTORIAL_STEPS.map((s) => s.id),
-    ['import', 'tapping', 'settings', 'export'],
+    ['import', 'tapping', 'bilingual', 'settings', 'export'],
   )
 })
 
@@ -3594,9 +3890,8 @@ test('第 2 步备有窄屏文案（播放条会隐藏「打轴」按钮）', ()
 })
 
 test('stepAt：越界返回 null（不抛异常）', () => {
-  assert.equal(stepAt(0).id, 'import')
-  assert.equal(stepAt(3).id, 'export')
-  assert.equal(stepAt(4), null)
+  assert.equal(stepAt(4).id, 'export')
+  assert.equal(stepAt(5), null)
   assert.equal(stepAt(-1), null)
   assert.equal(stepAt(1.5), null)
   assert.equal(stepAt(NaN), null)
@@ -3605,8 +3900,8 @@ test('stepAt：越界返回 null（不抛异常）', () => {
 test('nextStepIndex：最后一步返回 null（据此结束教程）', () => {
   assert.equal(nextStepIndex(0), 1)
   assert.equal(nextStepIndex(2), 3)
-  assert.equal(nextStepIndex(3), null, '最后一步的下一步应为 null')
-  assert.equal(nextStepIndex(-1), null)
+  assert.equal(nextStepIndex(3), 4)
+  assert.equal(nextStepIndex(4), null, '最后一步的下一步应为 null')
 })
 
 test('prevStepIndex：第一步返回 null（按钮应禁用）', () => {
@@ -3619,15 +3914,15 @@ test('isLastStep：只有最后一步为 true', () => {
   assert.equal(isLastStep(0), false)
   assert.equal(isLastStep(1), false)
   assert.equal(isLastStep(2), false)
-  assert.equal(isLastStep(3), true)
+  assert.equal(isLastStep(3), false)
+  assert.equal(isLastStep(4), true)
 })
 
 test('clampStepIndex：任意脏输入都落回合法范围', () => {
   assert.equal(clampStepIndex(-5), 0)
   assert.equal(clampStepIndex(0), 0)
   assert.equal(clampStepIndex(2), 2)
-  assert.equal(clampStepIndex(99), 3)
-  assert.equal(clampStepIndex(NaN), 0)
+  assert.equal(clampStepIndex(99), 4)
   assert.equal(clampStepIndex('2'), 2)
 })
 
@@ -3641,8 +3936,8 @@ test('从第 0 步一路 next 能走完并停在 null（不会越界）', () => 
     i = n
     visited.push(i)
   }
-  assert.deepEqual(visited, [0, 1, 2, 3])
-  assert.equal(nextStepIndex(3), null, '末尾必须停下')
+  assert.deepEqual(visited, [0, 1, 2, 3, 4])
+  assert.equal(nextStepIndex(4), null, '末尾必须停下')
   assert.ok(guard < 20, '不得死循环')
 })
 
@@ -4177,6 +4472,455 @@ test('round-trip：空行不会被解析器丢进 droppedLines', () => {
   assert.equal(doc.droppedLines.length, 0, '不应有被丢弃的行')
 })
 
+
+// ─────────────────────────────────────────────
+group('lrcParser · 逐字时间（增强 LRC）')
+
+test('解析增强标签 → chars（不再静默丢弃）', () => {
+  const doc = parseLrc('[00:01.00]<00:01.00>你<00:02.00>好')
+  assert.equal(doc.lines.length, 1)
+  assert.deepEqual(doc.lines[0].chars, [
+    { c: '你', t: 1 },
+    { c: '好', t: 2 },
+  ])
+  assert.equal(doc.lines[0].text, '你好', '正文不受影响')
+})
+
+test('无增强标签 → chars 为 null（向后兼容）', () => {
+  const doc = parseLrc('[00:01.00]普通行')
+  assert.equal(doc.lines[0].chars, null)
+  assert.equal(doc.lines[0].text, '普通行')
+})
+
+test('无增强标签时没有任何逐字相关警告', () => {
+  const doc = parseLrc('[00:01.00]A\n[00:02.00]B')
+  assert.equal(doc.warnings.some((w) => w.code === CODES.LRC_ENHANCED_DROPPED), false)
+  assert.equal(doc.warnings.some((w) => w.code === CODES.LRC_ENHANCED_MISMATCH), false)
+})
+
+test('无增强标签的行结构字段集合与改动前一致', () => {
+  const doc = parseLrc('[00:01.00]A')
+  assert.deepEqual(Object.keys(doc.lines[0]), [
+    'id', 't', 'rawT', 'text', 'chars', 'empty', 'beat', 'locked', 'sourceLine', 'duplicateOf',
+  ])
+})
+
+test('标点跟随前一个字（解析时归组，不是渲染时猜）', () => {
+  const doc = parseLrc('[00:01.00]<00:01.00>你好,<00:01.50>世界')
+  assert.deepEqual(doc.lines[0].chars, [
+    { c: '你好,', t: 1 },
+    { c: '世界', t: 1.5 },
+  ])
+})
+
+test('标点单独一个标签时并进紧邻的前一个字', () => {
+  // 标点跟随的是**紧邻的前一个标签**，不是整行的第一个字，
+  // 所以 t 取的是「好」的时间 1.2，不是「你」的 1.0。
+  const doc = parseLrc('[00:01.00]<00:01.00>你<00:01.20>好<00:01.30>，')
+  assert.deepEqual(doc.lines[0].chars, [
+    { c: '你', t: 1 },
+    { c: '好，', t: 1.2 },
+  ])
+})
+
+test('英文撇号不触发标点跟随（apostrophe 属于词内）', () => {
+  const doc = parseLrc("[00:01.00]<00:01.00>don't")
+  assert.deepEqual(doc.lines[0].chars, [{ c: "don't", t: 1 }])
+})
+
+test('行首无标签的正文不被丢弃（用整行时间兜底）', () => {
+  /*
+   * 逐字数据必须从剥离标签之前提取，否则第一个增强标签之前的正文会失去归属。
+   * 这里断言它拿到整行时间 —— 既不丢字也不丢时间。
+   */
+  const doc = parseLrc('[00:01.00]前奏<00:01.50>好')
+  assert.equal(doc.lines[0].text, '前奏好')
+  assert.deepEqual(doc.lines[0].chars, [
+    { c: '前奏', t: 1 },
+    { c: '好', t: 1.5 },
+  ])
+})
+
+test('多字一段作为一个 c（不按字符均分时间）', () => {
+  const doc = parseLrc('[00:01.00]<00:01.00>你好<00:02.00>世界')
+  assert.deepEqual(doc.lines[0].chars, [
+    { c: '你好', t: 1 },
+    { c: '世界', t: 2 },
+  ])
+})
+
+test('一行多标准标签 → 每个展开行都带上同一份 chars', () => {
+  const doc = parseLrc('[00:01.00][00:10.00]<00:01.00>你<00:01.50>好')
+  assert.equal(doc.lines.length, 2)
+  assert.deepEqual(doc.lines[0].chars, doc.lines[1].chars)
+  assert.deepEqual(doc.lines[0].chars, [
+    { c: '你', t: 1 },
+    { c: '好', t: 1.5 },
+  ])
+})
+
+test('增强标签单独出现（无标准标签）仍不产生歌词行', () => {
+  const doc = parseLrc('<00:01.00>你好')
+  assert.equal(doc.lines.length, 0)
+})
+
+test('非法逐字标签（秒数越界）→ 明确警告，不静默吞掉', () => {
+  const doc = parseLrc('[00:01.00]<00:99.00>你好')
+  assert.ok(
+    doc.warnings.some((w) => w.code === CODES.LRC_ENHANCED_DROPPED),
+    '应有降级警告，实际 ' + JSON.stringify(doc.warnings),
+  )
+})
+
+test('非法逐字标签不丢正文（降级后正文完整）', () => {
+  const doc = parseLrc('[00:01.00]<00:99.00>你好')
+  assert.equal(doc.lines[0].text, '你好')
+  assert.equal(doc.lines[0].chars, null, 'chars 无法解析时应为 null，而不是空数组')
+})
+
+test('降级警告带上出错的行号', () => {
+  const doc = parseLrc('[00:01.00]正常\n[00:02.00]<00:99.00>坏行')
+  const w = doc.warnings.find((x) => x.code === CODES.LRC_ENHANCED_DROPPED)
+  assert.ok(w)
+  assert.match(String(w.detail), /2/)
+})
+
+test('部分标签失效 → 仍给出降级警告，正文不丢', () => {
+  const doc = parseLrc('[00:01.00]<00:01.00>你<00:99.00>好')
+  assert.equal(doc.lines[0].text, '你好')
+  assert.ok(
+    doc.warnings.some((w) => w.code === CODES.LRC_ENHANCED_DROPPED),
+    '失效标签必须产生警告，实际 ' + JSON.stringify(doc.warnings),
+  )
+})
+
+test('offset 同时作用于行时间与逐字时间', () => {
+  const doc = parseLrc('[offset:500]\n[00:10.00]<00:10.00>你<00:11.00>好')
+  assert.equal(doc.lines[0].t, 9.5)
+  assert.deepEqual(doc.lines[0].chars, [
+    { c: '你', t: 9.5 },
+    { c: '好', t: 10.5 },
+  ])
+})
+
+test('offset 让逐字时间变负 → 夹到 0（与行时间一致）', () => {
+  const doc = parseLrc('[offset:2000]\n[00:01.00]<00:01.00>你')
+  assert.equal(doc.lines[0].t, 0)
+  assert.deepEqual(doc.lines[0].chars, [{ c: '你', t: 0 }])
+})
+
+test('withOffset 重算时逐字时间跟着走，来回改不累积误差', () => {
+  const doc = parseLrc('[00:10.00]<00:10.00>你<00:11.00>好')
+  const a = withOffset(doc.lines, 500).lines
+  const b = withOffset(a, -500).lines
+  assert.deepEqual(b[0].chars, [
+    { c: '你', t: 10 },
+    { c: '好', t: 11 },
+  ], 'offset 来回改应回到原值')
+})
+
+test('stats.enhancedLines 只统计真正解析出逐字的行', () => {
+  const doc = parseLrc('[00:01.00]<00:01.00>你\n[00:02.00]普通行')
+  assert.equal(doc.stats.enhancedLines, 1)
+})
+
+test('无增强标签时 stats 不出现 enhancedLines', () => {
+  const doc = parseLrc('[00:01.00]A')
+  assert.equal('enhancedLines' in doc.stats, false)
+})
+
+test('混合文件：有/无增强标签的行各自正确', () => {
+  const doc = parseLrc('[00:01.00]<00:01.00>你<00:01.50>好\n[00:05.00]普通一行')
+  assert.ok(Array.isArray(doc.lines[0].chars))
+  assert.equal(doc.lines[1].chars, null)
+  assert.deepEqual(doc.lines.map((l) => l.text), ['你好', '普通一行'])
+})
+
+// ── splitEnhancedSegments / toChars 直接单测 ──
+
+
+test('countInvalidEnhancedTags：正常行 → 0', () => {
+  assert.equal(countInvalidEnhancedTags('[00:01.00]<00:01.00>你<00:01.50>好'), 0)
+})
+
+test('countInvalidEnhancedTags：秒数越界被计为无效', () => {
+  assert.equal(countInvalidEnhancedTags('[00:01.00]<00:99.00>字'), 1)
+})
+
+test('countInvalidEnhancedTags：多个无效标签累计', () => {
+  assert.equal(countInvalidEnhancedTags('<00:99.00>甲<00:98.00>乙'), 2)
+})
+
+test('countInvalidEnhancedTags：非字符串 → 0', () => {
+  assert.equal(countInvalidEnhancedTags(/** @type {any} */ (null)), 0)
+})
+
+test('countInvalidEnhancedTags：无标签 → 0', () => {
+  assert.equal(countInvalidEnhancedTags('[00:01.00]普通'), 0)
+})
+
+group('lrcParser · splitEnhancedSegments / toChars')
+
+test('splitEnhancedSegments：基本切分', () => {
+  assert.deepEqual(splitEnhancedSegments('[00:01.00]<00:01.00>你<00:01.50>好'), [
+    { text: '你', t: 1 },
+    { text: '好', t: 1.5 },
+  ])
+})
+
+test('splitEnhancedSegments：非字符串 → 空数组', () => {
+  assert.deepEqual(splitEnhancedSegments(/** @type {any} */ (null)), [])
+  assert.deepEqual(splitEnhancedSegments(/** @type {any} */ (123)), [])
+})
+
+test('splitEnhancedSegments：无标签 → 空数组', () => {
+  assert.deepEqual(splitEnhancedSegments('[00:01.00]普通'), [])
+})
+
+test('splitEnhancedSegments：三位毫秒精度', () => {
+  assert.deepEqual(splitEnhancedSegments('<00:01.234>字'), [{ text: '字', t: 1.234 }])
+})
+
+test('splitEnhancedSegments：旧格式冒号小数点 <00:05:30>', () => {
+  assert.deepEqual(splitEnhancedSegments('<00:05:30>字'), [{ text: '字', t: 5.3 }])
+})
+
+test('splitEnhancedSegments：非法标签被跳过且不产生段', () => {
+  const out = splitEnhancedSegments('<00:99.00>字')
+  assert.deepEqual(out, [], '没有任何有效标签时不虚构段')
+})
+
+test('toChars：标点段并进前一个字', () => {
+  assert.deepEqual(toChars([{ text: '你', t: 1 }, { text: '，', t: 1.2 }], 0), [
+    { c: '你，', t: 1 },
+  ])
+})
+
+test('toChars：首段就是标点时保留（无处可跟）', () => {
+  assert.deepEqual(toChars([{ text: '，', t: 1 }], 0), [{ c: '，', t: 1 }])
+})
+
+test('toChars：空段被跳过', () => {
+  assert.deepEqual(toChars([{ text: '你', t: 1 }, { text: '  ', t: 1.2 }], 0), [
+    { c: '你', t: 1 },
+  ])
+})
+
+test('toChars：段无时间时用 fallbackT', () => {
+  assert.deepEqual(toChars([{ text: '前奏', t: null }], 7), [{ c: '前奏', t: 7 }])
+})
+
+test('toChars：脏输入不崩', () => {
+  assert.deepEqual(toChars(/** @type {any} */ (null), 0), [])
+  assert.deepEqual(toChars(/** @type {any} */ ([{ text: 42, t: 'x' }]), 3), [])
+})
+
+test('offsetChars：整体平移并夹到 0', () => {
+  assert.deepEqual(offsetChars([{ c: 'A', t: 5 }], 5, 1), [{ c: 'A', t: 4 }])
+  assert.deepEqual(offsetChars([{ c: 'A', t: 0.2 }], 0.2, 1), [{ c: 'A', t: 0 }])
+})
+
+test('offsetChars：chars 为 null 时原样返回 null', () => {
+  assert.equal(offsetChars(null, 5, 1), null)
+})
+
+test('offsetChars：脏 chars 不崩', () => {
+  assert.deepEqual(offsetChars(/** @type {any} */ ([{ c: 'A', t: 'bad' }]), 5, 1), [
+    { c: 'A', t: 4 },
+  ])
+})
+
+
+
+// ─────────────────────────────────────────────
+group('lrcWriter · 增强 LRC 双写（保留逐字时间）')
+
+test('buildLrcText enhanced=true → 写出逐字标签', () => {
+  const lines = [{ t: 1, text: '你好', chars: [{ c: '你', t: 1 }, { c: '好', t: 2 }] }]
+  assert.equal(
+    buildLrcText(lines, { includeMeta: false, enhanced: true }),
+    '[00:01.00]<00:01.00>你<00:02.00>好',
+  )
+})
+
+test('buildLrcText 默认不写增强标签（向下兼容，字节不变）', () => {
+  const lines = [{ t: 1, text: '你好', chars: [{ c: '你', t: 1 }, { c: '好', t: 2 }] }]
+  assert.equal(buildLrcText(lines, { includeMeta: false }), '[00:01.00]你好')
+  assert.equal(buildLrcText(lines, { includeMeta: false, enhanced: false }), '[00:01.00]你好')
+})
+
+test('buildLrcTitle enhanced：没有 chars 的行原样输出正文', () => {
+  const lines = [{ t: 1, text: '普通行', chars: null }]
+  assert.equal(buildLrcText(lines, { includeMeta: false, enhanced: true }), '[00:01.00]普通行')
+})
+
+test('增强输出总是先写标准标签（保证第三方播放器可播）', () => {
+  const lines = [{ t: 12.5, text: '词', chars: [{ c: '词', t: 12.5 }] }]
+  const out = buildLrcText(lines, { includeMeta: false, enhanced: true })
+  assert.ok(out.startsWith('[00:12.50]<00:12.50>'), '标准标签必须在最前：' + out)
+})
+
+test('增强输出：空 chars 数组退回标准写法，正文不消失', () => {
+  const lines = [{ t: 1, text: '有字', chars: [] }]
+  assert.equal(buildLrcText(lines, { includeMeta: false, enhanced: true }), '[00:01.00]有字')
+})
+
+test('增强输出：chars 里空字被跳过', () => {
+  const lines = [{ t: 1, text: '你好', chars: [{ c: '你', t: 1 }, { c: '  ', t: 1.5 }, { c: '好', t: 2 }] }]
+  assert.equal(
+    buildLrcText(lines, { includeMeta: false, enhanced: true }),
+    '[00:01.00]<00:01.00>你<00:02.00>好',
+  )
+})
+
+test('增强输出：字的时间是 NaN 时用整行时间兜底（不写出 <NaN>）', () => {
+  const lines = [{ t: 3, text: '字', chars: [{ c: '字', t: NaN }] }]
+  const out = buildLrcText(lines, { includeMeta: false, enhanced: true })
+  assert.equal(out, '[00:03.00]<00:03.00>字')
+  assert.equal(out.includes('NaN'), false)
+})
+
+test('增强输出：脏 chars（非对象）不抛异常', () => {
+  const lines = [{ t: 1, text: 'X', chars: [null, 'y', 42] }]
+  const out = buildLrcText(lines, { includeMeta: false, enhanced: true })
+  assert.equal(out, '[00:01.00]X', '有效字为 0 时应退回标准写法')
+})
+
+test('增强输出：精度 3 位可用', () => {
+  const lines = [{ t: 1.234, text: '字', chars: [{ c: '字', t: 1.234 }] }]
+  assert.equal(
+    buildLrcText(lines, { includeMeta: false, enhanced: true, precision: 3 }),
+    '[00:01.234]<00:01.234>字',
+  )
+})
+
+test('hasAnyChars：任一行有 chars 即为 true', () => {
+  assert.equal(hasAnyChars([{ t: 1, text: 'a', chars: [{ c: 'a', t: 1 }] }]), true)
+  assert.equal(hasAnyChars([{ t: 1, text: 'a', chars: null }]), false)
+  assert.equal(hasAnyChars([]), false)
+  assert.equal(hasAnyChars(null), false)
+})
+
+test('hasAnyChars：脏输入不崩', () => {
+  assert.equal(hasAnyChars([{ t: 1, chars: 'not-array' }]), false)
+  assert.equal(hasAnyChars([null, undefined]), false)
+})
+
+test('buildLrcDual：同时产出两份，标准版无逐字标签', () => {
+  const lines = [{ t: 1, text: '你好', chars: [{ c: '你', t: 1 }, { c: '好', t: 2 }] }]
+  const d = buildLrcDual(lines, { includeMeta: false })
+  assert.equal(d.standard, '[00:01.00]你好')
+  assert.equal(d.enhanced, '[00:01.00]<00:01.00>你<00:02.00>好')
+  assert.equal(d.standard.includes('<'), false)
+})
+
+test('buildLrcDual：两份的行数完全一致（不增删行）', () => {
+  const lines = [
+    { t: 1, text: '一', chars: [{ c: '一', t: 1 }] },
+    { t: 2, text: '', empty: true },
+    { t: 3, text: '三', chars: null },
+  ]
+  const d = buildLrcDual(lines, { includeMeta: false })
+  assert.equal(d.standard.split('\n').length, 3)
+  assert.equal(d.enhanced.split('\n').length, 3)
+})
+
+test('buildLrcDual：元数据同时写进两份', () => {
+  const lines = [{ t: 1, text: 'x', chars: [{ c: 'x', t: 1 }] }]
+  const d = buildLrcDual(lines, { meta: { title: '歌' } })
+  assert.ok(d.standard.startsWith('[ti:歌]'))
+  assert.ok(d.enhanced.startsWith('[ti:歌]'))
+})
+
+// ── 往返一致性（写出去必须能被重新解析） ──
+
+group('lrcWriter · 增强 LRC 往返一致')
+
+test('增强 LRC 重新解析 → chars 时间守恒', () => {
+  const original = [{ t: 1, text: '你好', chars: [{ c: '你', t: 1 }, { c: '好', t: 2.5 }] }]
+  const out = buildLrcText(original, { includeMeta: false, enhanced: true })
+  const doc = parseLrc(out, { encoding: 'utf-8' })
+  assert.equal(doc.lines.length, 1)
+  assert.deepEqual(doc.lines[0].chars, [{ c: '你', t: 1 }, { c: '好', t: 2.5 }])
+})
+
+test('往返：标点跟随在写入后被还原（不是重新猜的）', () => {
+  const original = [{ t: 1, text: '你好,世界', chars: [{ c: '你好,', t: 1 }, { c: '世界', t: 1.5 }] }]
+  const out = buildLrcText(original, { includeMeta: false, enhanced: true })
+  const doc = parseLrc(out, { encoding: 'utf-8' })
+  assert.deepEqual(doc.lines[0].chars, [{ c: '你好,', t: 1 }, { c: '世界', t: 1.5 }])
+  assert.equal(doc.lines[0].text, '你好,世界')
+})
+
+test('往返：正文一字不少、不重复', () => {
+  const original = [
+    { t: 1, text: '第一句歌词', chars: [{ c: '第一句', t: 1 }, { c: '歌词', t: 1.5 }] },
+    { t: 5, text: '', empty: true },
+    { t: 9, text: '第二句', chars: [{ c: '第二句', t: 9 }] },
+  ]
+  const out = buildLrcText(original, { includeMeta: false, enhanced: true })
+  const doc = parseLrc(out, { encoding: 'utf-8' })
+  assert.deepEqual(doc.lines.map((l) => l.text), ['第一句歌词', '', '第二句'])
+  assert.deepEqual(doc.lines.map((l) => l.t), [1, 5, 9])
+  assert.equal(doc.droppedLines.length, 0, '不应产生被丢弃的行')
+})
+
+test('往返：标准 LRC 重新解析后 chars 为 null（不凭空造数据）', () => {
+  const original = [{ t: 1, text: '你好', chars: [{ c: '你', t: 1 }, { c: '好', t: 2 }] }]
+  const out = buildLrcText(original, { includeMeta: false })
+  const doc = parseLrc(out, { encoding: 'utf-8' })
+  assert.equal(doc.lines[0].chars, null)
+  assert.equal(doc.lines[0].text, '你好')
+})
+
+test('往返：两次 round-trip 后逐字时间仍然不变（幂等）', () => {
+  const original = [{ t: 1, text: '你好', chars: [{ c: '你', t: 1 }, { c: '好', t: 2.5 }] }]
+  let out = buildLrcText(original, { includeMeta: false, enhanced: true })
+  for (let i = 0; i < 2; i++) {
+    const doc = parseLrc(out, { encoding: 'utf-8' })
+    out = buildLrcText(doc.lines, { includeMeta: false, enhanced: true })
+  }
+  assert.equal(out, '[00:01.00]<00:01.00>你<00:02.50>好')
+})
+
+test('往返：解析 → 双写 → 再解析，标准版与增强版正文一致', () => {
+  const raw = '[00:01.00]<00:01.00>你好,<00:01.50>世界\n[00:05.00]普通行'
+  const doc1 = parseLrc(raw, { encoding: 'utf-8' })
+  const d = buildLrcDual(doc1.lines, { includeMeta: false })
+  const fromStandard = parseLrc(d.standard, { encoding: 'utf-8' })
+  const fromEnhanced = parseLrc(d.enhanced, { encoding: 'utf-8' })
+  assert.deepEqual(
+    fromStandard.lines.map((l) => l.text),
+    fromEnhanced.lines.map((l) => l.text),
+    '两份文件的正文必须逐行一致',
+  )
+  assert.deepEqual(
+    fromStandard.lines.map((l) => l.t),
+    fromEnhanced.lines.map((l) => l.t),
+    '两份文件的时间必须逐行一致',
+  )
+  assert.deepEqual(fromEnhanced.lines[0].chars, [{ c: '你好,', t: 1 }, { c: '世界', t: 1.5 }])
+  assert.equal(fromStandard.lines[0].chars, null)
+})
+
+test('往返：增强 Lit 里含元数据时不污染歌词行', () => {
+  const lines = [{ t: 1, text: '你好', chars: [{ c: '你', t: 1 }, { c: '好', t: 2 }] }]
+  const out = buildLrcText(lines, { meta: { title: '标题' }, enhanced: true })
+  const doc = parseLrc(out, { encoding: 'utf-8' })
+  assert.equal(doc.lines.length, 1)
+  assert.equal(doc.meta.title, '标题')
+  assert.deepEqual(doc.lines[0].chars, [{ c: '你', t: 1 }, { c: '好', t: 2 }])
+})
+
+test('往返：带 offset 的增强文件重新解析后 chars 时间正确', () => {
+  const doc = parseLrc('[offset:500]\n[00:10.00]<00:10.00>你<00:11.00>好', { encoding: 'utf-8' })
+  const out = buildLrcText(doc.lines, { includeMeta: false, enhanced: true })
+  const back = parseLrc(out, { encoding: 'utf-8' })
+  // 写出的已是 offset 后的时间；再解析没有 offset 标签，结果应与写出值相同
+  assert.deepEqual(back.lines[0].chars, [{ c: '你', t: 9.5 }, { c: '好', t: 10.5 }])
+})
+
+
 // ─────────────────────────────────────────────
 group('lyricsStore.applyTapped · 两种打轴目标（修复静默丢数据）')
 
@@ -4664,9 +5408,781 @@ test('关闭描边时位置无关紧要（两种位置都不画描边）', () =>
   }
 })
 
+
+// ─────────────────────────────────────────────
+group('charProgress · charProgressAt（逐字进度：预览与导出共用的唯一几何）')
+
+test('chars 为 null / 空数组 → 0（没有逐字时间就不该有进度色）', () => {
+  assert.equal(charProgressAt(null, 5), 0)
+  assert.equal(charProgressAt(undefined, 5), 0)
+  assert.equal(charProgressAt([], 5), 0)
+})
+
+test('时间在首字之前 → 0', () => {
+  const chars = [
+    { c: '你', t: 1 },
+    { c: '好', t: 2 },
+  ]
+  assert.equal(charProgressAt(chars, 0.5), 0)
+})
+
+test('时间正好等于首字 → 0（首字还没唱完）', () => {
+  assert.equal(charProgressAt([{ c: 'a', t: 1 }, { c: 'b', t: 2 }], 1), 0)
+})
+
+test('时间在末字之后 → 1（末字唱完即整行全亮，不延伸到行尾）', () => {
+  const chars = [
+    { c: 'a', t: 1 },
+    { c: 'b', t: 2 },
+    { c: 'c', t: 3 },
+  ]
+  assert.equal(charProgressAt(chars, 3), 1)
+  assert.equal(charProgressAt(chars, 99), 1)
+})
+
+test('四个字、区间中点 → (i + 0.5) / 4', () => {
+  const chars = [
+    { c: 'a', t: 1 },
+    { c: 'b', t: 2 },
+    { c: 'c', t: 3 },
+    { c: 'd', t: 4 },
+  ]
+  // t=2.5 落在 b(2) 与 c(3) 之间 → i=1, ratio 0.5 → (1 + 0.5) / 4
+  assert.equal(charProgressAt(chars, 2.5), 0.375)
+  assert.equal(charProgressAt(chars, 1.5), 0.125) // i=0 → (0 + 0.5) / 4
+  assert.equal(charProgressAt(chars, 3.5), 0.625) // i=2 → (2 + 0.5) / 4
+})
+
+test('相邻两个字时间相等时不除零（ratio 按 0 处理，结果仍是有限数）', () => {
+  const chars = [
+    { c: 'a', t: 1 },
+    { c: 'b', t: 1 },
+    { c: 'c', t: 2 },
+  ]
+  const v = charProgressAt(chars, 1)
+  assert.ok(Number.isFinite(v), '不能是 NaN/Infinity')
+  assert.equal(v, 0)
+  const v2 = charProgressAt(chars, 1.5)
+  assert.ok(Number.isFinite(v2))
+  assert.equal(v2, 0.5)
+})
+
+test('全部字时间相等 → 不除零，末字之前恒为 0', () => {
+  const chars = [
+    { c: 'a', t: 1 },
+    { c: 'b', t: 1 },
+  ]
+  assert.equal(charProgressAt(chars, 1), 0)
+  assert.equal(charProgressAt(chars, 0.5), 0)
+})
+
+test('时间非法（NaN / undefined）→ 0，不把 NaN 传给 CSS/canvas', () => {
+  const chars = [{ c: 'a', t: 1 }, { c: 'b', t: 2 }]
+  assert.equal(charProgressAt(chars, NaN), 0)
+  assert.equal(charProgressAt(chars, undefined), 0)
+})
+
+test('单字：首字即末字，之前 0、到达 0、越过即 1（与多字行「首字时刻为 0」一致）', () => {
+  const chars = [{ c: 'a', t: 1 }]
+  assert.equal(charProgressAt(chars, 0.9), 0)
+  // 契约把「<= 首字 → 0」写在「>= 末字 → 1」之前；单字时两条同时成立，取前者：
+  // 与多字行在首字时刻也是 0 保持一致，不会出现「一到该字就整行全亮」
+  assert.equal(charProgressAt(chars, 1), 0)
+  assert.equal(charProgressAt(chars, 1.0001), 1)
+})
+
+test('进度单调不减（时间递增时不会回退，且始终落在 0..1）', () => {
+  const chars = [
+    { c: 'a', t: 0 },
+    { c: 'b', t: 1 },
+    { c: 'c', t: 3 },
+    { c: 'd', t: 4 },
+  ]
+  let prev = -1
+  for (let t = 0; t <= 4; t += 0.05) {
+    const v = charProgressAt(chars, t)
+    assert.ok(v >= prev, 't=' + t.toFixed(2) + ' 进度回退了：' + v + ' < ' + prev)
+    assert.ok(v >= 0 && v <= 1, 't=' + t.toFixed(2) + ' 进度越界：' + v)
+    prev = v
+  }
+})
+
+
+test('默认模式是 smooth（既有调用方行为不变）', () => {
+  assert.equal(DEFAULT_CHAR_PROGRESS_MODE, 'smooth')
+  const chars = [{ c: 'a', t: 1 }, { c: 'b', t: 2 }, { c: 'c', t: 3 }]
+  // 两参数调用 = 默认 smooth，中间值必须带字内插值
+  assert.ok(charProgressAt(chars, 1.5) > 0 && charProgressAt(chars, 1.5) < 1 / 3)
+  assert.equal(charProgressAt(chars, 1.5, 'smooth'), charProgressAt(chars, 1.5))
+})
+
+test('step 模式：整字跳变（未到下一字时间点不前进）', () => {
+  const chars = [{ c: 'a', t: 1 }, { c: 'b', t: 2 }, { c: 'c', t: 3 }]
+  /*
+   * step 与 smooth 共用二分结果 lo（最后一个 t <= timeSec 的下标），
+   * 差别只在 ratio：step 恒为 0。所以：
+   *   t=1.5 → lo=0 → 0/3 = 0        （第 1 个字还没唱完，一个字都不算）
+   *   t=2   → lo=1 → 1/3            （第 1 个字唱完）
+   *   t=2.99→ lo=1 → 1/3            （没到第 3 字，停在 1 个字）
+   * 这与 smooth 在 t=1（首字时刻）也是 0 的既有约定一致。
+   */
+  assert.equal(charProgressAt(chars, 1.5, 'step'), 0)
+  assert.equal(charProgressAt(chars, 2, 'step'), 1 / 3)
+  assert.equal(charProgressAt(chars, 2.99, 'step'), 1 / 3)
+})
+
+test('两种模式在边界上完全一致（首字前/首字/末字/末字后/null）', () => {
+  const chars = [{ c: 'a', t: 1 }, { c: 'b', t: 2 }, { c: 'c', t: 3 }]
+  for (const t of [0, 0.5, 1, 3, 99]) {
+    assert.equal(charProgressAt(chars, t, 'step'), charProgressAt(chars, t), `t=${t} 两模式应一致`)
+  }
+  assert.equal(charProgressAt(null, 5, 'step'), 0)
+  assert.equal(charProgressAt([], 5, 'step'), 0)
+})
+
+test('模式白名单：未知值退回 smooth（脏输入不得产生 NaN）', () => {
+  const chars = [{ c: 'a', t: 1 }, { c: 'b', t: 2 }]
+  const smooth = charProgressAt(chars, 1.5)
+  assert.equal(charProgressAt(chars, 1.5, 'bogus'), smooth)
+  assert.equal(charProgressAt(chars, 1.5, null), smooth)
+})
+
+test('CHAR_PROGRESS_MODES 只含已实现的两种', () => {
+  assert.deepEqual([...CHAR_PROGRESS_MODES], ['smooth', 'step'])
+})
+group('charProgress · isCharTimed')
+
+test('chars 非数组 / 空数组 → false', () => {
+  assert.equal(isCharTimed(null), false)
+  assert.equal(isCharTimed(undefined), false)
+  assert.equal(isCharTimed({}), false)
+  assert.equal(isCharTimed({ chars: null }), false)
+  assert.equal(isCharTimed({ chars: [] }), false)
+})
+
+test('全部 t 是有限数 → true', () => {
+  assert.equal(isCharTimed({ chars: [{ c: 'a', t: 0 }, { c: 'b', t: 1 }] }), true)
+})
+
+test('有一个 t 不是有限数 → false（NaN 会让进度色静默失效）', () => {
+  assert.equal(isCharTimed({ chars: [{ c: 'a', t: 0 }, { c: 'b', t: null }] }), false)
+  assert.equal(isCharTimed({ chars: [{ c: 'a', t: 0 }, { c: 'b', t: NaN }] }), false)
+  assert.equal(isCharTimed({ chars: [{ c: 'a', t: 0 }, { c: 'b' }] }), false)
+})
+
+group('charProgress · splitChars（拆字 / 标点跟随 / 空格不单独成字）')
+
+const charsOf = (text) => splitChars(text).map((ch) => ch.c)
+
+test('中文：一字一字拆开', () => {
+  assert.deepEqual(charsOf('你好世界'), ['你', '好', '世', '界'])
+})
+
+test('中文：标点跟随前一个字，不独立成字', () => {
+  assert.deepEqual(charsOf('你好，世界'), ['你', '好，', '世', '界'])
+  assert.deepEqual(charsOf('真的吗？'), ['真', '的', '吗？'])
+})
+
+test('英文：字母逐个拆，标点跟随前一个字母', () => {
+  assert.deepEqual(charsOf('Hi!'), ['H', 'i!'])
+})
+
+test('英文：空格并进前一个词（空格不单独成字、也不占一次打轴）', () => {
+  assert.deepEqual(charsOf('Hello world'), ['H', 'e', 'l', 'l', 'o ', 'w', 'o', 'r', 'l', 'd'])
+})
+
+test('行首空白并入第一个字（不为它单独造一个字）', () => {
+  assert.deepEqual(charsOf('  你好'), ['  你', '好'])
+})
+
+test('整行只有标点/空白时仍造一个字（不静默丢内容）', () => {
+  assert.deepEqual(charsOf('，。'), ['，。'])
+  assert.deepEqual(charsOf('   '), ['   '])
+})
+
+test('空串 → 空数组', () => {
+  assert.deepEqual(charsOf(''), [])
+})
+
+test('拆字结果拼回来严格等于原文（渲染与导出都依赖这个等式）', () => {
+  const samples = ['你好，世界', "Hello world! it's ok.", '  前导空格', '你好 ， 世界', 'a b  c', '句末。']
+  for (const s of samples) {
+    assert.equal(splitChars(s).map((ch) => ch.c).join(''), s, '拼回来不等于原文：' + s)
+  }
+})
+
+test('拆出来的字默认没有时间（t 为 null）', () => {
+  for (const ch of splitChars('你好')) assert.equal(ch.t, null)
+})
+
+test('isTappableChar：纯空白不可单独打轴，其余都可', () => {
+  assert.equal(isTappableChar(' '), false)
+  assert.equal(isTappableChar('   '), false)
+  assert.equal(isTappableChar('你'), true)
+  assert.equal(isTappableChar('好，'), true)
+  assert.equal(isTappableChar(''), false)
+})
+
+group('charProgress · 行时间闸（无行时间必须拒绝，不能静默）')
+
+test('没有 t（null）→ 拒绝并给出原因', () => {
+  const reason = charTapRefusal({ t: null, text: '你好' })
+  assert.ok(typeof reason === 'string' && reason.length > 0, '必须给出可读原因')
+})
+
+test('t 缺失 / NaN / 非数字 → 拒绝', () => {
+  assert.ok(charTapRefusal({ text: '你好' }))
+  assert.ok(charTapRefusal({ t: NaN, text: '你好' }))
+  assert.ok(charTapRefusal({ t: '1.5', text: '你好' }))
+})
+
+test('t = 0 是合法行时间（不能把 0 当成「没有时间」）', () => {
+  assert.equal(charTapRefusal({ t: 0, text: '你好' }), null)
+})
+
+test('没有正文 / 正文拆不出字 → 拒绝', () => {
+  assert.ok(charTapRefusal({ t: 1, text: '' }))
+  assert.ok(charTapRefusal({ t: 1 }))
+})
+
+test('行时间存在时放行（返回 null）', () => {
+  assert.equal(charTapRefusal({ t: 1.5, text: '你好' }), null)
+})
+
+test('charTapStep 遇到没有行时间的行 → blocked，且不写入任何时间', () => {
+  const st = createCharTapState()
+  const lines = [{ t: null, text: '你好' }]
+  const r = charTapStep(st, lines, 1.2)
+  assert.equal(r.ok, false)
+  assert.equal(r.blocked, true)
+  assert.ok(r.reason && r.reason.length > 0, '必须给出原因')
+  assert.equal(st.cursor, 0, '被拒绝时光标不能前进')
+  assert.deepEqual(st.drafts, {}, '被拒绝时不能建出草稿')
+})
+
+group('charProgress · 逐字打轴状态机')
+
+const zhLines = () => [
+  { t: 1, text: '你好，世界' },
+  { t: 5, text: '再见' },
+]
+
+test('中文逐字：四次空格依次记下四个字，时间取自传入的音频位置', () => {
+  const st = createCharTapState()
+  const lines = zhLines()
+  const times = [1.2, 1.4, 1.6, 1.8]
+  const got = []
+  for (const t of times) got.push(charTapStep(st, lines, t))
+
+  assert.deepEqual(got.map((r) => r.ok), [true, true, true, true])
+  assert.deepEqual(got.map((r) => r.c), ['你', '好，', '世', '界'])
+  assert.deepEqual(got.map((r) => r.t), times, '记下的时间必须逐字等于传入值')
+  assert.deepEqual(
+    st.drafts[0].map((ch) => [ch.c, ch.t]),
+    [['你', 1.2], ['好，', 1.4], ['世', 1.6], ['界', 1.8]],
+  )
+})
+
+test('中文逐字：打完一行自动换到下一行，光标归零', () => {
+  const st = createCharTapState()
+  const lines = zhLines()
+  for (const t of [1.2, 1.4, 1.6]) charTapStep(st, lines, t)
+  const last = charTapStep(st, lines, 1.8)
+  assert.equal(last.nextLineIndex, 1)
+  assert.equal(last.nextCursor, 0)
+  assert.equal(st.lineIndex, 1)
+})
+
+test('英文逐字：空格不占一次打轴（10 次按键打完 Hello world）', () => {
+  const st = createCharTapState()
+  const lines = [{ t: 0, text: 'Hello world' }]
+  const got = []
+  for (let i = 0; i < 10; i++) got.push(charTapStep(st, lines, i + 0.5))
+
+  assert.deepEqual(got.map((r) => r.c), ['H', 'e', 'l', 'l', 'o ', 'w', 'o', 'r', 'l', 'd'])
+  assert.ok(got.every((r) => r.ok), '不应出现被拒绝的按键')
+  assert.equal(st.drafts[0].length, 10, '空格并进了前一个字，总字数仍是 10')
+})
+
+test('标点跟随：标点那一次按键落在前一个字上，不产生独立的标点字', () => {
+  const st = createCharTapState()
+  const lines = [{ t: 0, text: '好，' }]
+  charTapStep(st, lines, 1)
+  charTapStep(st, lines, 2)
+  assert.deepEqual(st.drafts[0].map((ch) => ch.c), ['好，'], '只有一个字')
+  assert.equal(st.drafts[0][0].t, 2, '第二次按键覆盖同一个字（末字覆盖）')
+})
+
+test('末行末字再按空格 → 覆盖末字（不能没反应）', () => {
+  const st = createCharTapState()
+  const lines = [{ t: 0, text: 'ab' }]
+  charTapStep(st, lines, 1)
+  charTapStep(st, lines, 2)
+  assert.equal(st.cursor, 2, '本行打完后光标停在末尾之后')
+
+  const r = charTapStep(st, lines, 3)
+  assert.equal(r.ok, true, '再按一次必须有结果')
+  assert.equal(r.charIndex, 1, '落在末字上')
+  assert.equal(r.isNew, false, '是覆盖不是新增')
+  assert.equal(st.drafts[0][1].t, 3, '末字时间被改写')
+  assert.equal(st.drafts[0][0].t, 1, '首字不受影响')
+})
+
+test('撤销：还原时间并把光标一起退回去（否则再按空格会跳过该字）', () => {
+  const st = createCharTapState()
+  const lines = [{ t: 0, text: 'abcd' }]
+  charTapStep(st, lines, 1)
+  charTapStep(st, lines, 2)
+  assert.equal(st.cursor, 2)
+
+  const r = charUndoStep(st)
+  assert.deepEqual(r, { lineIndex: 0, charIndex: 1, t: null })
+  assert.equal(st.drafts[0][1].t, null, '被撤销的字回到未打状态')
+  assert.equal(st.drafts[0][0].t, 1, '前一个字不受影响')
+  assert.equal(st.cursor, 1, '光标退回该字')
+
+  const again = charTapStep(st, lines, 2.5)
+  assert.equal(again.charIndex, 1)
+  assert.equal(st.drafts[0][1].t, 2.5)
+})
+
+test('撤销：无可撤销时返回 null（不能崩）', () => {
+  assert.equal(charUndoStep(createCharTapState()), null)
+})
+
+test('撤销：能撤销「覆盖」（覆盖也进撤销栈）', () => {
+  const st = createCharTapState()
+  const lines = [{ t: 0, text: 'a' }]
+  charTapStep(st, lines, 1)
+  charTapStep(st, lines, 2)
+  assert.equal(st.drafts[0][0].t, 2)
+  const r = charUndoStep(st)
+  assert.equal(r.t, 1, '应回到覆盖前的值')
+  assert.equal(st.drafts[0][0].t, 1)
+})
+
+test('撤销栈上限：超过 CHAR_UNDO_LIMIT 后丢最老的（不会无限涨）', () => {
+  const st = createCharTapState()
+  const lines = [{ t: 0, text: 'a' }]
+  for (let i = 0; i < CHAR_UNDO_LIMIT + 20; i++) charTapStep(st, lines, i + 1)
+  assert.equal(st.undo.length, CHAR_UNDO_LIMIT)
+})
+
+test('暂停：暂停期间音频时间不走，两次按键记下同一个时间（允许相等）', () => {
+  const st = createCharTapState()
+  const lines = [{ t: 0, text: '你好' }]
+  charTapStep(st, lines, 3)
+  charTapStep(st, lines, 3)
+  assert.deepEqual(st.drafts[0].map((ch) => ch.t), [3, 3], '暂停期间两次按键时间必须相同')
+})
+
+test('暂停：墙钟过去多久都不影响记录的时间（禁用 Date.now/performance.now）', () => {
+  const st = createCharTapState()
+  const lines = [{ t: 0, text: 'ab' }]
+  charTapStep(st, lines, 2)
+  charTapStep(st, lines, 2)
+  assert.deepEqual(st.drafts[0].map((ch) => ch.t), [2, 2], '暂停里等 30 秒也不能让时间变成 32')
+})
+
+test('恢复播放：时间继续按音频位置前进', () => {
+  const st = createCharTapState()
+  const lines = [{ t: 0, text: 'abc' }]
+  charTapStep(st, lines, 1)
+  charTapStep(st, lines, 1)
+  charTapStep(st, lines, 1.7)
+  assert.deepEqual(st.drafts[0].map((ch) => ch.t), [1, 1, 1.7])
+})
+
+test('倍速：0.5 倍速下时间逐字等于音频位置，不按按键间隔累加', () => {
+  const st = createCharTapState()
+  const lines = [{ t: 0, text: 'abcd' }]
+  const audioTimes = [0, 0.5, 1.0, 1.5]
+  for (const t of audioTimes) charTapStep(st, lines, t)
+  assert.deepEqual(st.drafts[0].map((ch) => ch.t), audioTimes)
+})
+
+test('倍速切换后时间仍然只认音频位置（1x → 1.5x → 0.75x 混合）', () => {
+  const st = createCharTapState()
+  const lines = [{ t: 0, text: 'abcdef' }]
+  const audioTimes = [0, 1, 2, 3.5, 4.1, 4.9]
+  for (const t of audioTimes) charTapStep(st, lines, t)
+  assert.deepEqual(st.drafts[0].map((ch) => ch.t), audioTimes)
+})
+
+test('重新定位：光标落到第一个还没打过的字', () => {
+  const st = createCharTapState()
+  const lines = [{ t: 0, text: 'abcd' }]
+  charTapStep(st, lines, 1)
+  charTapStep(st, lines, 2)
+  assert.equal(charRelocateCursor(st.drafts[0]), 2, '前两个字打过了，应落到第三个')
+})
+
+test('重新定位：整行都打过了则回到 0（用户通常想重打这一行）', () => {
+  assert.equal(charRelocateCursor([{ t: 1 }, { t: 2 }]), 0)
+  assert.equal(charRelocateCursor([]), 0)
+})
+
+test('行下标越界时夹回合法范围（歌词变少后不访问不存在的行）', () => {
+  const st = createCharTapState()
+  st.lineIndex = 99
+  const lines = [{ t: 0, text: 'a' }]
+  const r = charTapStep(st, lines, 1)
+  assert.equal(r.ok, true)
+  assert.equal(r.lineIndex, 0)
+})
+
+test('完全空的歌词 → 拒绝而不是崩', () => {
+  const st = createCharTapState()
+  const r = charTapStep(st, [], 1)
+  assert.equal(r.ok, false)
+  assert.equal(r.blocked, true)
+})
+
+test('countTimedChars：只数已打时间的字', () => {
+  assert.equal(countTimedChars(null), 0)
+  assert.equal(countTimedChars([]), 0)
+  assert.equal(countTimedChars([{ t: 1 }, { t: null }, { t: 2 }]), 2)
+})
+
+group('charProgress · 持久化（localStorage + textHash 指纹）')
+
+test('序列化只存已打时间的字（字表可随时由正文重建）', () => {
+  const st = createCharTapState()
+  const lines = [{ t: 0, text: 'abcd' }]
+  charTapStep(st, lines, 1)
+  charTapStep(st, lines, 2)
+  const raw = serializeCharState(st, charDraftTextHash(lines))
+  const d = JSON.parse(raw)
+  assert.equal(d.drafts['0'].length, 2, '只存打过时间的两个字')
+  assert.ok(typeof d.textHash === 'string' && d.textHash.length > 0)
+})
+
+test('保存/恢复往返：已打时间、光标、行号都回来', () => {
+  const st = createCharTapState()
+  const lines = zhLines()
+  charTapStep(st, lines, 1.2)
+  charTapStep(st, lines, 1.4)
+  const hash = charDraftTextHash(lines)
+  const raw = serializeCharState(st, hash)
+
+  const parsed = parseCharState(raw, hash)
+  assert.equal(parsed.ok, true)
+  assert.equal(parsed.lineIndex, st.lineIndex)
+  assert.equal(parsed.cursor, st.cursor)
+
+  const aligned = alignSavedDrafts(parsed.drafts, lines)
+  assert.deepEqual(aligned[0].map((ch) => [ch.c, ch.t]), [['你', 1.2], ['好，', 1.4], ['世', null], ['界', null]])
+})
+
+test('恢复的字表是完整的（未打的字不能消失，否则光标会跳过它们）', () => {
+  const hydrated = hydrateCharDraft('abcd', [{ c: 'a', t: 1 }])
+  assert.deepEqual(hydrated.map((ch) => ch.c), ['a', 'b', 'c', 'd'])
+  assert.deepEqual(hydrated.map((ch) => ch.t), [1, null, null, null])
+})
+
+test('指纹不符（歌词改过）→ 整份丢弃，不静默错位', () => {
+  const lines = [{ t: 0, text: '你好' }]
+  const raw = serializeCharState({ drafts: { 0: [{ c: '你', t: 1 }, { c: '好', t: 2 }] }, lineIndex: 0, cursor: 2 }, charDraftTextHash(lines))
+  const r = parseCharState(raw, 'deadbeef')
+  assert.equal(r.ok, false)
+  assert.equal(r.reason, 'hash-mismatch')
+})
+
+test('指纹相符 → 正常恢复', () => {
+  const lines = [{ t: 0, text: '你好' }]
+  const hash = charDraftTextHash(lines)
+  const raw = serializeCharState({ drafts: { 0: [{ c: '你', t: 1 }, { c: '好', t: 2 }] }, lineIndex: 0, cursor: 2 }, hash)
+  assert.equal(parseCharState(raw, hash).ok, true)
+})
+
+test('空 / 损坏 / 非法 JSON → 分别给出 empty / corrupt / invalid，不抛异常', () => {
+  assert.deepEqual(parseCharState(null, 'x'), { ok: false, reason: 'empty' })
+  assert.deepEqual(parseCharState('', 'x'), { ok: false, reason: 'empty' })
+  assert.deepEqual(parseCharState('{oops', 'x'), { ok: false, reason: 'corrupt' })
+  assert.deepEqual(parseCharState('null', 'x'), { ok: false, reason: 'invalid' })
+  assert.deepEqual(parseCharState('42', 'x'), { ok: false, reason: 'invalid' })
+})
+
+test('行数变少 → 多出来的草稿丢弃（不对不存在的行留草稿）', () => {
+  const saved = { 0: [{ c: 'a', t: 1 }], 5: [{ c: 'x', t: 9 }] }
+  const aligned = alignSavedDrafts(saved, [{ t: 0, text: 'a' }])
+  assert.deepEqual(Object.keys(aligned), ['0'])
+})
+
+test('正文改过、一个字都对不上 → 该行不留草稿', () => {
+  const saved = { 0: [{ c: '甲', t: 1 }, { c: '乙', t: 2 }] }
+  const aligned = alignSavedDrafts(saved, [{ t: 0, text: '丙丁' }])
+  assert.deepEqual(aligned, {})
+})
+
+test('正文局部改过：能对上的字保留时间，对不上的回到未打（不错位）', () => {
+  const saved = { 0: [{ c: 'a', t: 1 }, { c: 'X', t: 2 }] }
+  const aligned = alignSavedDrafts(saved, [{ t: 0, text: 'ab' }])
+  assert.equal(aligned[0][0].t, 1)
+  assert.equal(aligned[0][1].t, null)
+})
+
+test('fnv1a：确定性 + 不同文本不同值 + 固定长度十六进制', () => {
+  assert.equal(fnv1a('abc'), fnv1a('abc'))
+  assert.notEqual(fnv1a('abc'), fnv1a('abd'))
+  assert.match(fnv1a(''), /^[0-9a-f]{8}$/)
+  assert.match(fnv1a('你好世界'), /^[0-9a-f]{8}$/)
+})
+
+test('textHash 用打轴目标行的正文（行数相同但文字改了必须判死）', () => {
+  const a = charDraftTextHash([{ text: '第一行' }, { text: '第二行' }])
+  const b = charDraftTextHash([{ text: '第一行' }, { text: '第二行改' }])
+  assert.notEqual(a, b)
+  assert.equal(a, charDraftTextHash([{ text: '第一行' }, { text: '第二行' }]))
+})
+
+test('持久化键是契约规定的 lrc-scroller:charTapping:v1（与逐行的键不同）', () => {
+  assert.equal(CHAR_STORAGE_KEY, 'lrc-scroller:charTapping:v1')
+})
+
+group('charProgress · 与逐行打轴的隔离（两套草稿并存，互不污染）')
+
+test('逐字打轴只改 char* 字段，绝不碰逐行的 tapped / editingIndex / undoStack', () => {
+  const lineTapped = [{ t: 1, beat: 0, locked: false }, null]
+  const lineUndo = [{ index: 0, prev: null, prevEditing: 0, prevLast: -1 }]
+  const state = createCharTapState()
+  state.tapped = lineTapped
+  state.editingIndex = 1
+  state.lastTappedIndex = 0
+  state.undoStack = lineUndo
+  state.done = false
+
+  const lines = [{ t: 1, text: '你好' }, { t: 5, text: '再见' }]
+  charTapStep(state, lines, 1.2)
+  charTapStep(state, lines, 1.4)
+  charUndoStep(state)
+
+  assert.deepEqual(state.tapped, [{ t: 1, beat: 0, locked: false }, null], '逐行 tapped 被污染了')
+  assert.equal(state.editingIndex, 1, '逐行 editingIndex 被污染了')
+  assert.equal(state.lastTappedIndex, 0, '逐行 lastTappedIndex 被污染了')
+  assert.deepEqual(state.undoStack, lineUndo, '逐行 undoStack 被污染了')
+  assert.equal(state.done, false)
+})
+
+test('逐字记录不带逐行的 beat/locked 字段（两套结构不会混在一起）', () => {
+  const state = createCharTapState()
+  const lines = [{ t: 1, text: '你好，世界' }]
+  charTapStep(state, lines, 1.2)
+  assert.ok(Array.isArray(state.drafts[0]))
+  assert.equal(typeof state.drafts[0][0].c, 'string', '逐字记录带字')
+  assert.equal(state.drafts[0][0].beat, undefined, '逐字记录不带逐行的 beat 字段')
+})
+
+test('逐字撤销栈独立于逐行撤销栈（形状不同，互不消费）', () => {
+  const state = createCharTapState()
+  const lines = [{ t: 1, text: 'ab' }]
+  charTapStep(state, lines, 1.2)
+  assert.equal(state.undo.length, 1)
+  assert.ok(state.undo[0].prevT !== undefined, '逐字撤销栈记的是 prevT/prevCursor')
+  assert.ok(state.undo[0].prevEditing === undefined, '逐字撤销栈不含逐行的 prevEditing')
+  assert.equal(state.undoStack, undefined, '逐行撤销栈没有被创建/消费')
+})
+
+test('逐字打轴不会改动传入的 lines（草稿与歌词分离）', () => {
+  const lines = [{ t: 1, text: '你好' }]
+  const before = JSON.stringify(lines)
+  const st = createCharTapState()
+  charTapStep(st, lines, 1.2)
+  charTapStep(st, lines, 1.4)
+  assert.equal(JSON.stringify(lines), before, 'lines 被就地改写了 —— 草稿必须与歌词分离')
+})
+
+// ─────────────────────────────────────────────
+group('逐字进度色 · 渲染层（预览与导出必须一致）')
+
+/** 造一行有逐字时间的歌词 */
+function charLine(text, times, t0) {
+  const chars = [...text].map((c, i) => ({ c, t: t0 + times[i] }))
+  return { id: `c${t0}`, t: t0, text, chars, empty: false }
+}
+
+/** 取一次绘制里第一个裁剪矩形的宽度；没有裁剪返回 null */
+function clipWidth(probe) {
+  const rect = probe.ops.find((o) => o.op === 'rect')
+  return rect ? rect.w : null
+}
+
+test('没有逐字时间的行：导出不产生任何裁剪（向后兼容硬要求）', () => {
+  const plain = [{ id: 'a', t: 0, text: '你好世界', chars: null, empty: false }]
+  const probe = drawAt(createDefaultSettings(), plain, 1)
+  assert.equal(probe.ops.filter((o) => o.op === 'clip').length, 0, 'chars=null 时不该有任何裁剪')
+})
+
+test('有逐字时间的行：导出产生裁剪，且宽度随进度递增', () => {
+  const line = charLine('你好世界', [0, 1, 2, 3], 0)
+  const settings = createDefaultSettings()
+  const early = clipWidth(drawAt(settings, [line], 0.5))
+  const late = clipWidth(drawAt(settings, [line], 2.9))
+  assert.ok(early !== null, '早期应有裁剪矩形')
+  assert.ok(late !== null, '后期应有裁剪矩形')
+  assert.ok(late > early, '进度越大，裁剪宽度必须越宽')
+})
+
+test('进度 0（首字未到）时不裁剪、不重画', () => {
+  const line = charLine('你好', [0, 1], 5)
+  const probe = drawAt(createDefaultSettings(), [line], 4.5)
+  assert.equal(probe.ops.filter((o) => o.op === 'clip').length, 0, '进度 0 不该裁剪')
+})
+
+test('进度 1（末字之后）时裁剪宽度 = 整行文字宽度', () => {
+  const line = charLine('你好', [0, 1], 0)
+  const full = clipWidth(drawAt(createDefaultSettings(), [line], 99))
+  assert.ok(full !== null, '末字之后应有裁剪')
+  /*
+   * 用「同一行在 t 很小但非 0」与「t=99」的比例来反推，
+   * 而不是写死字号 —— canvas 字号是按参考高度自适应缩放的。
+   */
+  const tiny = clipWidth(drawAt(createDefaultSettings(), [line], 0.0001))
+  assert.ok(full > tiny, '整行宽度必须大于首字刚起的宽度')
+})
+
+test('进度色来自 settings.color.charProgress（与预览同一个设置项）', () => {
+  const line = charLine('你好', [0, 1], 0)
+  const settings = createDefaultSettings()
+  settings.color.charProgress = '#ff0000'
+  const probe = drawAt(settings, [line], 0.5)
+  const red = probe
+    .texts()
+    .filter((o) => /#ff0000|255,\s*0,\s*0/.test(String(o.fillStyle)))
+  assert.ok(red.length > 0, '应有用进度色重画的文字')
+})
+
+test('默认进度色是 #4c8dff', () => {
+  assert.equal(createDefaultSettings().color.charProgress, '#4c8dff')
+})
+
+test('sanitizeSettings 保住 charProgress，脏值被兜底为默认色', () => {
+  assert.equal(sanitizeSettings({ color: { charProgress: '#123456' } }).color.charProgress, '#123456')
+  assert.equal(sanitizeSettings({ color: { charProgress: 'not-a-color' } }).color.charProgress, '#4c8dff')
+  assert.equal(sanitizeSettings({}).color.charProgress, '#4c8dff', '缺省时必须补上默认值')
+})
+
+test('toCssVars 产出 --lrc-color-char-progress（预览侧读它）', () => {
+  const s = createDefaultSettings()
+  s.color.charProgress = '#abcdef'
+  assert.equal(toCssVars(s)['--lrc-color-char-progress'], '#abcdef')
+})
+
+test('预览与导出用同一个 charProgressAt：裁剪宽度比 = 进度比', () => {
+  const line = charLine('你好世界', [0, 1, 2, 3], 0)
+  const settings = createDefaultSettings()
+  const fullW = clipWidth(drawAt(settings, [line], 99))
+  assert.ok(fullW > 0, '末字之后必须给出整行宽度作为基准')
+
+  for (const t of [0.5, 1, 1.5, 2, 2.7]) {
+    const w = clipWidth(drawAt(settings, [line], t))
+    const expected = charProgressAt(line.chars, t)
+    assert.ok(w !== null, `t=${t} 应有裁剪`)
+    const got = w / fullW
+    assert.ok(
+      Math.abs(got - expected) < 1e-6,
+      `t=${t} 预览 ${expected} 与导出 ${got} 必须一致`
+    )
+  }
+})
+
+test('描边开启时进度段也描边（不能因为加了进度色就丢描边）', () => {
+  const line = charLine('你好', [0, 1], 0)
+  const settings = createDefaultSettings()
+  settings.stroke.width = 0.08
+  const probe = drawAt(settings, [line], 0.5)
+  const stroked = probe.strokes().filter((o) => o.lineWidth > 0)
+  assert.ok(stroked.length > 0, '进度段必须带描边')
+})
+
+// ─────────────────────────────────────────────
+group('增强 LRC 往返 · 逐字时间保存→读取→导出→再解析必须一致')
+
+/** 造带逐字时间的行 */
+function rtLine(id, t, text, chars) {
+  return { id, t, text, chars, empty: false }
+}
+
+/** 导出增强 LRC 再解析回来 */
+function roundTrip(lines) {
+  const text = buildLrcText(lines, { enhanced: true, precision: 2 })
+  return { text, back: parseLrc(text) }
+}
+
+test('中文逐字：正文、字表、时间三项往返一致', () => {
+  const lines = [rtLine('a', 1, '你好，世界', [
+    { c: '你', t: 1 }, { c: '好，', t: 1.5 }, { c: '世', t: 2 }, { c: '界', t: 2.5 },
+  ])]
+  const { back } = roundTrip(lines)
+  const got = back.lines[0]
+  assert.equal(got.text, '你好，世界')
+  assert.equal(got.chars.map((c) => c.c).join(''), '你好，世界')
+  for (let i = 0; i < lines[0].chars.length; i++) {
+    assert.ok(Math.abs(got.chars[i].t - lines[0].chars[i].t) < 0.006)
+  }
+})
+
+test('英文逐字：词间空格往返不丢（曾实测丢失的 bug）', () => {
+  const chars = [
+    { c: 'H', t: 5 }, { c: 'e', t: 5.3 }, { c: 'l', t: 5.6 }, { c: 'l', t: 5.9 },
+    { c: 'o ', t: 6.2 }, { c: 'w', t: 6.5 }, { c: 'o', t: 6.8 }, { c: 'r', t: 7.1 },
+    { c: 'l', t: 7.4 }, { c: 'd', t: 7.7 },
+  ]
+  const lines = [rtLine('b', 5, 'Hello world', chars)]
+  const { back } = roundTrip(lines)
+  const got = back.lines[0]
+  assert.equal(got.text, 'Hello world', '正文空格不能丢')
+  assert.equal(got.chars.map((c) => c.c).join(''), 'Hello world', '字表空格不能丢')
+  assert.equal(got.chars[4].c, 'o ', '尾随空格必须留在片段里')
+})
+
+test('标点跟随：标点留在前一个字的片段里，不独立成字', () => {
+  const lines = [rtLine('c', 1, 'A、B。C', [
+    { c: 'A、', t: 1 }, { c: 'B。', t: 1.5 }, { c: 'C', t: 2 },
+  ])]
+  const { back } = roundTrip(lines)
+  assert.equal(back.lines[0].chars.map((c) => c.c).join(''), 'A、B。C')
+  assert.equal(back.lines[0].chars.length, 3, '标点不占独立字位')
+})
+
+test('没有逐字时间的行：往返后仍是 chars=null（不伪造）', () => {
+  const lines = [rtLine('d', 9, '无逐字时间', null)]
+  const { back } = roundTrip(lines)
+  const got = back.lines[0]
+  assert.equal(got.text, '无逐字时间')
+  assert.ok(!got.chars || got.chars.length === 0, '不得凭空造出逐字时间')
+})
+
+test('混合文件：有逐字与无逐字行并存，各走各的', () => {
+  const lines = [
+    rtLine('e1', 1, '你好', [{ c: '你', t: 1 }, { c: '好', t: 1.5 }]),
+    rtLine('e2', 3, 'plain line', null),
+  ]
+  const { back } = roundTrip(lines)
+  assert.equal(back.lines.length, 2)
+  assert.equal(back.lines[0].chars.length, 2)
+  assert.ok(!back.lines[1].chars || back.lines[1].chars.length === 0)
+})
+
+test('普通 LRC 导出不含增强标签（原有功能仍可用）', () => {
+  const lines = [rtLine('f', 1, '你好', [{ c: '你', t: 1 }, { c: '好', t: 1.5 }])]
+  const std = buildLrcText(lines, { enhanced: false })
+  assert.ok(!std.includes('<'), '普通 LRC 不能出现逐字标签')
+  assert.ok(std.includes('你好'), '正文必须完整')
+})
+
+test('纯空白段仍被跳过（不产生空字）', () => {
+  const chars = toChars([
+    { text: '你', t: 1 },
+    { text: '  ', t: 1.5 },
+    { text: '好', t: 2 },
+  ], 1)
+  assert.equal(chars.length, 2, '纯空白段不该成字')
+})
 // ─────────────────────────────────────────────
 console.log(`\n${'─'.repeat(48)}`)
 console.log(`通过 ${passed} 项，失败 ${failed} 项`)
 console.log('─'.repeat(48))
 
 if (failed > 0) process.exit(1)
+

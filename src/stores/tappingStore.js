@@ -2,6 +2,18 @@ import { defineStore } from 'pinia'
 import { useLyricsStore } from './lyricsStore'
 import { useSettingsStore } from './settingsStore'
 import { validateBpm, beatTimes, nearestBeat } from '@/core/beat'
+import {
+  CHAR_STORAGE_KEY,
+  alignSavedDrafts,
+  charDraftTextHash,
+  charRelocateCursor,
+  charTapStep,
+  charUndoStep,
+  countTimedChars,
+  parseCharState,
+  serializeCharState,
+  splitChars,
+} from '@/core/charProgress'
 
 /**
  * 打轴（快速打时间点）的会话状态。
@@ -89,6 +101,49 @@ export const useTappingStore = defineStore('tapping', {
      * @type {Array<{index:number, prev:TapRecord|null, prevEditing:number, prevLast:number}>}
      */
     undoStack: [],
+
+    // ── 逐字打轴（增强 LRC）──────────────────────
+    /*
+     * 【为什么整块另起一套字段，而不是复用 tapped】
+     * 逐行与逐字是两套完全不同的草稿：
+     *   逐行 = 每行一个时间点（Array<TapRecord|null>）
+     *   逐字 = 每行一串字时间（Record<行下标, Array<{c,t}>>）
+     * 复用同一份 tapped 的话，切一次模式就会互相覆盖 ——
+     * 而用户常常是"先逐行打完、再挑几行逐字精修"，两份草稿都要留着。
+     * 字段名也刻意不复用（charMode / charDraft / charUndoStack），
+     * 这样任何一处误写都能被读代码的人一眼看出来。
+     */
+
+    /** 逐字模式开关（与逐行的 enabled 相互独立） */
+    charMode: false,
+
+    /** 逐字打轴当前行（tapTarget 的下标） */
+    charLineIndex: 0,
+
+    /** 当前行内的光标：下一个要打轴的字 */
+    charCursor: 0,
+
+    /**
+     * 逐字草稿：行下标 → 完整字表 [{c, t}]。
+     * 未打的字 t 为 null（字表始终完整，光标才不会跳过未打的字）。
+     * @type {Record<number, Array<{c:string, t:number|null}>>}
+     */
+    charDraft: {},
+
+    /**
+     * 逐字撤销栈。
+     * @type {Array<{lineIndex:number, cursor:number, prevT:number|null, prevLineIndex:number, prevCursor:number}>}
+     */
+    charUndoStack: [],
+
+    /**
+     * 逐字草稿对应的目标类型（'dropped' | 'lines'）。
+     * 与 tappedKind 同理：只比长度会张冠李戴，必须连"目标是谁"一起比。
+     */
+    charTargetKind: /** @type {'dropped'|'lines'} */ ('lines'),
+
+    /** 建立 charDraft 时的目标行数（判断"歌词换了"的第二个依据） */
+    charTargetCount: 0,
   }),
 
   getters: {
@@ -150,6 +205,62 @@ export const useTappingStore = defineStore('tapping', {
 
     /** 是否还能撤销 */
     canUndo: (state) => state.undoStack.length > 0,
+
+    // ── 逐字（增强 LRC）────────────────────────
+
+    /** 当前逐字行的完整字表（未拆过则空数组） */
+    charChars(state) {
+      const chars = state.charDraft[state.charLineIndex]
+      return Array.isArray(chars) ? chars : []
+    },
+
+    /** 当前逐字行已打轴的字数 */
+    charTimedCount(state) {
+      const chars = state.charDraft[state.charLineIndex]
+      return countTimedChars(chars)
+    },
+
+    /**
+     * 逐字打轴的进度 0~1（当前行内）。
+     *
+     * 【为什么按"字"而不是按"行"】
+     * 逐字模式下用户关心的就是这一行还剩几个字，按行算会一直停在 0。
+     * 全曲进度由 charOverallProgress 另给。
+     */
+    charLineProgress() {
+      const total = this.charChars.length
+      if (total === 0) return 0
+      return this.charTimedCount / total
+    },
+
+    /** 全曲逐字进度：已打字数 / 总字数 */
+    charOverallProgress(state) {
+      let timed = 0
+      let total = 0
+      for (const key of Object.keys(state.charDraft)) {
+        const chars = state.charDraft[key]
+        if (!Array.isArray(chars)) continue
+        total += chars.length
+        timed += countTimedChars(chars)
+      }
+      if (total === 0) return 0
+      return timed / total
+    },
+
+    /** 逐字草稿是否为空（决定要不要提示"已保存"） */
+    charHasDraft(state) {
+      return Object.keys(state.charDraft).length > 0
+    },
+
+    /** 逐字是否还能撤销 */
+    charCanUndo: (state) => state.charUndoStack.length > 0,
+
+    /** 当前逐字行是否已经打完（光标停在末尾之后） */
+    charLineDone() {
+      const chars = this.charChars
+      if (chars.length === 0) return false
+      return this.charTimedCount >= chars.length
+    },
   },
 
   actions: {
@@ -429,6 +540,249 @@ export const useTappingStore = defineStore('tapping', {
       this.done = false
       this.undoStack = []
       this._save()
+    },
+
+// ── 逐字打轴（增强 LRC）────────────────────
+    /*
+     * 【这一整块为什么不碰任何逐行字段】
+     * 逐行与逐字必须能并存：用户常常先逐行打完时间轴，
+     * 再挑几行做逐字精修。只要有一个函数顺手写了 tapped/editingIndex，
+     * 逐行草稿就会被逐字动作污染 —— 而这种污染极难在界面上发现。
+     * 所以下面每个动作都只读写 char* 字段，并且各自存各自的键。
+     */
+
+    /**
+     * 打开逐字模式。
+     *
+     * 【为什么打开前先 restore】
+     * 草稿在 localStorage 里，可能是上次会话存的。
+     * 先恢复再判断"目标是否变了"，才能把不匹配的草稿一次性丢掉，
+     * 而不是让用户看到一半打过的字、一半没打。
+     *
+     * @returns {{restored:boolean, discarded:'hash-mismatch'|'corrupt'|'empty'|null}}
+     */
+    charEnable() {
+      const r = this.charRestore()
+      this.charMode = true
+      this.charEnsureSize()
+      return r
+    },
+
+    /** 关闭逐字模式（**保留** charDraft / charCursor / charUndoStack） */
+    charDisable() {
+      this.charMode = false
+      this.charSave()
+    },
+
+    /** 切换逐字模式 */
+    charToggle() {
+      if (this.charMode) this.charDisable()
+      else this.charEnable()
+      return this.charMode
+    },
+
+    /**
+     * 确保逐字草稿与当前目标行数组对齐。
+     *
+     * 与 ensureSize 同理：只比长度不够，必须连"目标是谁"一起比 ——
+     * 纯 lrc 的 lines 与纯 txt 的 droppedLines 是两批完全不同的行。
+     * @returns {boolean} 是否发生了重置
+     */
+    charEnsureSize() {
+      const n = this.tapTarget.length
+      const kind = this.tapTargetKind
+      if (this.charTargetCount === n && this.charTargetKind === kind) return false
+
+      this.charDraft = {}
+      this.charUndoStack = []
+      this.charLineIndex = 0
+      this.charCursor = 0
+      this.charTargetKind = kind
+      this.charTargetCount = n
+      this.charSave()
+      return true
+    },
+
+    /**
+     * 把 store 的 char* 字段适配成 charProgress 纯函数认识的形状。
+     *
+     * 【为什么用 defineProperty 而不是传普通对象】
+     * 纯函数是**就地改写** state 的（见 charTapStep 注释）。
+     * 传普通对象的话，改写落在临时对象上，store 一点没变 —— 界面不会更新，
+     * 而纯函数却返回了 ok:true，是最难查的一类"看起来成功了"的失败。
+     * 用存取器把读和写都接到 store 上，改写直接落到响应式字段。
+     * @returns {any}
+     */
+    _charStateRef() {
+      const self = this
+      const ref = {}
+      Object.defineProperty(ref, 'drafts', {
+        get: () => self.charDraft,
+        set: (v) => {
+          self.charDraft = v
+        },
+      })
+      Object.defineProperty(ref, 'lineIndex', {
+        get: () => self.charLineIndex,
+        set: (v) => {
+          self.charLineIndex = v
+        },
+      })
+      Object.defineProperty(ref, 'cursor', {
+        get: () => self.charCursor,
+        set: (v) => {
+          self.charCursor = v
+        },
+      })
+      Object.defineProperty(ref, 'undo', {
+        get: () => self.charUndoStack,
+        set: (v) => {
+          self.charUndoStack = v
+        },
+      })
+      return ref
+    },
+
+    /**
+     * 空格：给光标处的字打一个时间点。
+     *
+     * 【t 只能来自音频真实播放位置】
+     * 调用方传的是 player.currentTime。这里绝不读 performance.now / Date.now，
+     * 也绝不按按键间隔累加 —— 变速播放时按键间隔与音频时间不是一回事。
+     *
+     * @param {number} t 播放头（秒）
+     * @returns {{ok:boolean, blocked?:boolean, reason?:string, lineIndex?:number, charIndex?:number, c?:string, t?:number, isNew?:boolean, nextLineIndex?:number, nextCursor?:number}}
+     */
+    charRecord(t) {
+      this.charEnsureSize()
+      const r = charTapStep(this._charStateRef(), this.tapTarget, t)
+      if (r.ok) this.charSave()
+      return r
+    },
+
+    /**
+     * 撤销一步逐字打轴（连光标一起还原）。
+     * @returns {{lineIndex:number, charIndex:number, t:number|null}|null}
+     */
+    charUndo() {
+      const r = charUndoStep(this._charStateRef())
+      if (r) this.charSave()
+      return r
+    },
+
+    /**
+     * 重新定位到某一行（用户点行 / 跳转用）。
+     * 光标落到"第一个还没打过的字"；都打过了就回到 0（通常是想重打）。
+     * @param {number} lineIndex
+     * @returns {{lineIndex:number, cursor:number}|null}
+     */
+    charRelocate(lineIndex) {
+      const n = this.tapTarget.length
+      if (!Number.isInteger(lineIndex) || lineIndex < 0 || lineIndex >= n) return null
+      const chars = Array.isArray(this.charDraft[lineIndex])
+        ? this.charDraft[lineIndex]
+        : /** @type {any} */ (this._charBuildDraft(lineIndex))
+      const cursor = charRelocateCursor(chars)
+      this.charLineIndex = lineIndex
+      this.charCursor = cursor
+      this.charSave()
+      return { lineIndex, cursor }
+    },
+
+    /**
+     * 建（或取）某一行的完整字表。
+     * 单独抽出来，是为了让"只是把某行展开成字"与"打一个时间点"分开：
+     * 界面在逐字模式下要显示每行的字，不能靠按空格来触发。
+     * @param {number} lineIndex
+     * @returns {Array<{c:string, t:number|null}>}
+     */
+    _charBuildDraft(lineIndex) {
+      const line = this.tapTarget[lineIndex]
+      if (!line || typeof line.text !== 'string') return []
+      const existing = this.charDraft[lineIndex]
+      if (Array.isArray(existing) && existing.length > 0) return existing
+      const chars = splitChars(line.text)
+      this.charDraft[lineIndex] = chars
+      return chars
+    },
+
+    /**
+     * 清空逐字草稿（"重新打这一行/全部"用）。
+     * @param {'line'|'all'} scope
+     */
+    charReset(scope) {
+      if (scope === 'line') {
+        delete this.charDraft[this.charLineIndex]
+        this.charCursor = 0
+      } else {
+        this.charDraft = {}
+        this.charLineIndex = 0
+        this.charCursor = 0
+      }
+      this.charUndoStack = []
+      this.charSave()
+    },
+
+    // ── 逐字草稿持久化（localStorage）──────────
+
+    /**
+     * 存逐字草稿到 localStorage。
+     *
+     * 【为什么逐字用 localStorage，逐行用 sessionStorage】
+     * 逐字是**精修**：一行十几个字，打错一个要重来十几次，
+     * 用户很可能分几次做完，关掉标签页也要留着。
+     * 逐行是粗打，一次能打完，sessionStorage 的"关掉就干净"更合适。
+     * 两者的键也完全不同，互不影响。
+     */
+    charSave() {
+      try {
+        localStorage.setItem(
+          CHAR_STORAGE_KEY,
+          serializeCharState(
+            { drafts: this.charDraft, lineIndex: this.charLineIndex, cursor: this.charCursor },
+            charDraftTextHash(this.tapTarget),
+          ),
+        )
+      } catch {
+        /* 隐私模式等场景写不进去就算了，不影响功能 */
+      }
+    },
+
+    /**
+     * 从 localStorage 恢复逐字草稿。
+     *
+     * 【指纹不符必须整份丢弃】
+     * 逐字时间的下标含义完全由正文决定。歌词改过一个字，
+     * 旧草稿套上去就是错位的，而错位的时间轴比没有时间轴更难查 ——
+     * 所以宁可丢掉并明确告诉用户，也不做"尽力匹配"。
+     *
+     * @returns {{restored:boolean, discarded:'hash-mismatch'|'corrupt'|'empty'|'invalid'|null}}
+     */
+    charRestore() {
+      let raw = null
+      try {
+        raw = localStorage.getItem(CHAR_STORAGE_KEY)
+      } catch {
+        return { restored: false, discarded: null }
+      }
+      const parsed = parseCharState(raw, charDraftTextHash(this.tapTarget))
+      if (!parsed.ok) {
+        return { restored: false, discarded: parsed.reason === 'empty' ? null : /** @type {any} */ (parsed.reason) }
+      }
+
+      const aligned = alignSavedDrafts(parsed.drafts, this.tapTarget)
+      if (Object.keys(aligned).length === 0) return { restored: false, discarded: null }
+
+      this.charDraft = aligned
+      this.charTargetKind = this.tapTargetKind
+      this.charTargetCount = this.tapTarget.length
+      // 恢复的光标可能指到不存在的行/字上（歌词变短），夹回合法范围
+      const li = Number.isFinite(parsed.lineIndex) ? Math.trunc(parsed.lineIndex) : 0
+      this.charLineIndex = Math.min(Math.max(0, li), Math.max(0, this.tapTarget.length - 1))
+      const chars = aligned[this.charLineIndex]
+      const cur = Number.isFinite(parsed.cursor) ? Math.trunc(parsed.cursor) : 0
+      this.charCursor = Array.isArray(chars) ? Math.min(Math.max(0, cur), chars.length) : 0
+      return { restored: true, discarded: null }
     },
 
     // ── sessionStorage 持久化 ────────────────────

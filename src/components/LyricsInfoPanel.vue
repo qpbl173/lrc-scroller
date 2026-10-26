@@ -39,11 +39,49 @@ function resetOffset() {
 
 /** 预览前几行，方便肉眼确认时间是否正确 */
 const preview = computed(() => lyrics.lines.slice(0, 6))
+
+/** 同时间的多行组（双语）——只有存在这种组时才显示调换按钮 */
+const bilingualGroups = computed(() => {
+  const groups = []
+  const lines0 = lyrics.lines
+  let i = 0
+  while (i < lines0.length) {
+    let j = i
+    while (j < lines0.length && lines0[j].t === lines0[i].t) j++
+    if (j - i > 1) {
+      const seg = lines0.slice(i, j)
+      // 两行都非空才算真正的双语组（排除间奏空行凑数）
+      if (seg.filter((l) => !l.empty).length >= 2) groups.push(seg)
+    }
+    i = j
+  }
+  return groups
+})
+
+const hasBilingual = computed(() => bilingualGroups.value.length > 0)
+const bilingualCount = computed(() => bilingualGroups.value.length)
+
+/** 一键调换：把同时间各行的正文互换 */
+function onSwapBilingual() {
+  lyrics.swapBilingualLines()
+}
+
+/**
+ * 切换双语组的放大规则。
+ *
+ * auto 会交回解析器的内容判断，所以它需要重走一遍 offset 重算；
+ * top / bottom 只是改 isTranslation 标记，直接重算即可。
+ *
+ * @param {"auto"|"top"|"bottom"} mode
+ */
+function onPrimaryMode(mode) {
+  lyrics.setPrimaryMode(mode)
+}
 </script>
 
 <template>
   <section class="info" :class="{ 'is-collapsed': collapsed }" aria-label="歌词信息">
-    <button class="info__head" type="button" :aria-expanded="!collapsed" @click="collapsed = !collapsed">
+    <button class="info__head" data-tour="lyrics-info" type="button" :aria-expanded="!collapsed" @click="collapsed = !collapsed">
       <span class="info__chevron" :class="{ 'is-open': !collapsed }" aria-hidden="true">▸</span>
       <span class="info__title">歌词信息</span>
 
@@ -118,6 +156,37 @@ const preview = computed(() => lyrics.lines.slice(0, 6))
           修改偏移时，全部时间都从文件的<strong>原始时间</strong>重新计算，反复调整不会累积误差。
         </p>
 
+        <!--
+          双语歌词：放大哪一行可以自定义。
+
+          【为什么需要】解析器按启发式挑「原文」（含中日韩文字优先），
+          所以「英文原文 + 中文翻译」的文件会被判反 —— 原文被缩小。
+          这里给两个入口：换规则（放大上行/下行）或换内容（调换上下行）。
+        -->
+        <div v-if="hasBilingual" class="info__block" data-tour="bilingual">
+          <h3 class="info__label">
+            双语歌词
+            <span class="info__hint-inline">共 {{ bilingualCount }} 组</span>
+          </h3>
+
+          <div class="info__mode">
+            <span class="info__mode-label">放大哪一行</span>
+            <select class="info__select" :value="lyrics.primaryMode" @change="onPrimaryMode($event.target.value)">
+              <option value="auto">自动判断（按内容）</option>
+              <option value="top">放大上行</option>
+              <option value="bottom">放大下行</option>
+            </select>
+          </div>
+
+          <button class="info__swap-btn" type="button" @click="onSwapBilingual">
+            调换上下行内容
+          </button>
+
+          <p class="info__note">
+            <strong>放大上行/下行</strong>改的是规则：组内第一行或最后一行放大，与内容无关。
+            <strong>调换上下行内容</strong>改的是数据：把正文互换，规则不变。
+          </p>
+        </div>
         <!-- 时间预览：改 offset 时这里会立刻变化，方便肉眼验证 -->
         <div class="info__preview">
           <div v-for="l in preview" :key="l.id" class="preview-row">
@@ -367,6 +436,57 @@ const preview = computed(() => lyrics.lines.slice(0, 6))
 .info__unit {
   color: var(--ui-text-dim);
   font-size: 11px;
+}
+
+.info__mode {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 8px;
+}
+
+.info__mode-label {
+  color: var(--ui-text-dim);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.info__select {
+  flex: 1;
+  padding: 6px 8px;
+  border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius-sm);
+  background: var(--ui-panel-2);
+  color: inherit;
+  font-size: var(--ui-font-sm);
+}
+
+/*
+  调换按钮做成圆角灰底：
+  它原本是 btn--ghost（透明底），用户反馈「没看见」——
+  双语区不是高频操作，但一旦需要就找不到，代价很高。
+  给它一块实体底色，让它在面板里先被看见。
+*/
+.info__swap-btn {
+  width: 100%;
+  margin-top: 8px;
+  padding: 8px 12px;
+  border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius-sm);
+  background: var(--ui-panel-2);
+  color: inherit;
+  font-size: var(--ui-font-sm);
+  cursor: pointer;
+  transition: background 120ms ease, border-color 120ms ease;
+}
+
+.info__swap-btn:hover {
+  background: var(--ui-panel-3, var(--ui-panel-2));
+  border-color: var(--ui-accent, var(--ui-border));
+}
+
+.info__swap-btn:active {
+  transform: translateY(1px);
 }
 
 .info__note {

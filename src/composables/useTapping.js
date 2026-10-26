@@ -29,6 +29,17 @@ export const NUDGE_STEP_BIG_MS = 100
 export const APPLY_UNDO_MS = 3000
 
 /**
+ * 逐字打轴可用的倍速档位。
+ *
+ * 【为什么只有 5 档，比播放器的 6 档少一个 2x】
+ * 2 倍速下字的间隔被压到 0.5 倍，按空格根本跟不上，
+ * 打出来的时间反而更不准。逐字需要"放慢"而不是"加快"，
+ * 所以上限停在 1.5，把 0.5/0.75 两个慢速档留给精修。
+ * 播放器本身的 RATES 不改（那是听歌的档位，不是打轴的档位）。
+ */
+export const CHAR_RATES = [0.5, 0.75, 1, 1.25, 1.5]
+
+/**
  * 深拷贝一个 Vue 响应式数组。
  *
  * 【为什么不能直接 structuredClone】
@@ -346,6 +357,236 @@ export function useTapping() {
     return null
   }
 
+// ── 逐字打轴（增强 LRC）──────────────────────
+  /*
+   * 【为什么逐字的入口全部集中在这里，而不是直接让组件调 store】
+   * 逐字打轴要同时做三件事：改 store、滚视野、必要时动播放头。
+   * 组件只该知道"用户按了空格"，不该知道这三件事的顺序。
+   * 与逐行的 tap()/undo() 一样，本文件是唯一的状态机。
+   */
+
+  /**
+   * 逐字模式开关。
+   * @param {boolean} on
+   */
+  function setCharEnabled(on) {
+    if (on) {
+      const r = tapping.charEnable()
+      if (r.discarded === 'hash-mismatch') {
+        ui.push({
+          level: 'warn',
+          message: '歌词已改动，逐字草稿已丢弃',
+          hint: '正文变了，旧的逐字时间会错位，所以整份作废',
+        })
+      } else if (r.restored) {
+        ui.push({
+          level: 'info',
+          message: '已恢复逐字打轴草稿',
+          hint: '空格给当前字打时间 · 逐字模式可暂停播放慢慢打',
+        })
+      } else if (tapping.totalCount === 0) {
+        ui.push({
+          level: 'warn',
+          message: '当前没有可打轴的行',
+          hint: '请先导入歌词文本（.lrc 或 .txt）',
+        })
+      } else {
+        ui.push({
+          level: 'info',
+          message: '已进入逐字打轴模式',
+          hint: '空格给当前字打时间点 · 标点跟随前一个字',
+        })
+      }
+    } else {
+      const has = tapping.charHasDraft
+      tapping.charDisable()
+      ui.push({
+        level: 'info',
+        message: has ? '已退出逐字打轴模式 · 草稿已保存' : '已退出逐字打轴模式',
+      })
+    }
+  }
+
+  function toggleChar() {
+    setCharEnabled(!tapping.charMode)
+    return tapping.charMode
+  }
+
+  /**
+   * 逐字模式下按空格：给光标处的字打时间。
+   *
+   * 【时间只取 player.currentTime】
+   * 这是需求的硬约束：变速播放、暂停、拖动之后，
+   * 只有音频播放位置才是"这个字是在第几秒被唱出来的"。
+   * 按键间隔、performance.now、Date.now 全都不是音频时间。
+   *
+   * @returns {{ok:boolean, blocked?:boolean, reason?:string, ...}|null}
+   */
+  function charTap() {
+    if (!tapping.charMode) return null
+    tapping.charEnsureSize()
+    const r = tapping.charRecord(player.currentTime)
+
+    if (r.blocked) {
+      // 拒绝必须让用户看见，不能静默 —— 否则他会以为按键坏了
+      ui.push({ level: 'warn', message: r.reason })
+      return r
+    }
+    if (r.ok) {
+      scrollTargetIntoView(r.lineIndex)
+      // 打到一个新字时，视野要跟着换行
+      if (r.nextLineIndex !== r.lineIndex) scrollTargetIntoView(r.nextLineIndex)
+    }
+    return r
+  }
+
+  /**
+   * 逐字撤销一步。
+   * 与逐行撤销不同，这里**不回滚播放头** ——
+   * 逐字是精修，用户往往停在原地重打，播放头一动就对不上了。
+   * @returns {{lineIndex:number, charIndex:number, t:number|null}|null}
+   */
+  function charUndo() {
+    if (!tapping.charMode) return null
+    const r = tapping.charUndo()
+    if (!r) return null
+    scrollTargetIntoView(r.lineIndex)
+    return r
+  }
+
+  /**
+   * 逐字模式下的 Ctrl+Z 分流：优先逐字撤销。
+   * @returns {'char'|null}
+   */
+  function charUndoAny() {
+    if (tapping.charMode && tapping.charCanUndo) {
+      charUndo()
+      return 'char'
+    }
+    return null
+  }
+
+  /**
+   * 逐字模式下把播放头挪到当前行的时间点。
+   *
+   * 【为什么需要这个】
+   * 逐字必须跟着音频走：用户点某一行想重打，
+   * 播放头还停在别处的话，一按空格就记下一个完全无关的时间。
+   * 先跳到该行行时间，用户再点播放、跟着唱。
+   *
+   * @param {number} lineIndex
+   * @returns {{lineIndex:number, cursor:number}|null}
+   */
+  function charRelocate(lineIndex) {
+    if (!tapping.charMode) return null
+    const r = tapping.charRelocate(lineIndex)
+    if (!r) return null
+    const line = tapping.tapTarget[r.lineIndex]
+    if (line && Number.isFinite(line.t)) engine.seek(Math.max(0, line.t))
+    scrollTargetIntoView(r.lineIndex)
+    return r
+  }
+
+  /**
+   * 逐字模式下用 ←/→ 在字之间挪光标（不记录时间）。
+   *
+   * 【为什么要能挪光标】
+   * 手打一定会打错字（漏一个、多按一下）。逐字没有"行"这种天然边界，
+   * 光靠撤销只能一步步退，退到第 8 个字要按 8 次。
+   * 挪光标让用户直接退到打错的那个字上重打。
+   *
+   * 【为什么只在本行内挪，不跨行】
+   * 跨行挪光标等于换行，而换行伴随播放头是否要跟着跳的问题
+   * （跟着跳就打断播放，不跳就记错时间）。那是 charRelocate 的职责，
+   * 由用户显式点行触发，不该由一个方向键隐式决定。
+   *
+   * @param {number} dir -1 退一格 / +1 进一格
+   * @returns {{lineIndex:number, cursor:number}|null}
+   */
+  function charStepCursor(dir) {
+    if (!tapping.charMode) return null
+    const chars = tapping.charChars
+    if (chars.length === 0) return null
+    const cur = tapping.charCursor
+    const next = Math.min(Math.max(0, cur + (dir >= 0 ? 1 : -1)), chars.length - 1)
+    tapping.charCursor = next
+    return { lineIndex: tapping.charLineIndex, cursor: next }
+  }
+
+  /**
+   * 逐字打轴的倍速切换（只在 CHAR_RATES 里循环）。
+   * @param {number} dir +1 加快 / -1 放慢
+   * @returns {number} 新倍速
+   */
+  function cycleCharRate(dir) {
+    const cur = player.rate
+    const i = CHAR_RATES.indexOf(cur)
+    // 当前倍速不在逐字档位里（比如从播放器切到 2x 再进来）→ 从最接近的 1x 起算
+    const base = i < 0 ? 2 : i
+    const next = CHAR_RATES[(base + (dir >= 0 ? 1 : -1) + CHAR_RATES.length) % CHAR_RATES.length]
+    engine.setRate(next)
+    return next
+  }
+
+  /**
+   * 逐字模式下应用：把 charDraft 写回 lyrics.lines 的 chars 字段。
+   *
+   * 【只写有完整逐字时间的行】
+   * 半行逐字（打了 3 个字就停了）写回去会让渲染层拿到一串不完整的 chars，
+   * charProgressAt 会算出"3 个字就整行亮完"的假进度。
+   * 所以只接受"每个字都有 t"的行。
+   *
+   * @returns {{applied:number, skipped:number}|null}
+   */
+  function applyChars() {
+    if (!tapping.charMode) return null
+    /*
+     * 【为什么只认 'lines' 目标】
+     * charDraft 的下标是 **tapTarget** 的下标（契约第 2 条）。
+     * 混合文件里 tapTarget 是无时间的 droppedLines，那些行本来就没有行时间，
+     * 逐字打轴对它们全是"被拒绝"状态，因此永远不会有草稿；
+     * 而若照旧按下标写进 lyrics.lines，就是拿 A 行的字去改 B 行 —— 静默错位。
+     * 逐字精修的前提是"这一行已经有时间轴"，那就是 lines。
+     */
+    if (tapping.tapTargetKind !== 'lines') {
+      ui.push({
+        level: 'warn',
+        message: '当前打轴目标是无时间的行，无法逐字应用',
+        hint: '逐字需要该行已有行时间，请先逐行打完时间轴',
+      })
+      return null
+    }
+    const drafts = tapping.charDraft
+    let applied = 0
+    let skipped = 0
+    const nextLines = lyrics.lines.map((line, i) => {
+      const chars = drafts[i]
+      if (!Array.isArray(chars) || chars.length === 0) return line
+      const complete = chars.every((ch) => ch && Number.isFinite(ch.t))
+      if (!complete) {
+        skipped++
+        return line
+      }
+      applied++
+      return { ...line, chars: chars.map((ch) => ({ c: ch.c, t: ch.t })) }
+    })
+    if (applied === 0) {
+      ui.push({
+        level: 'warn',
+        message: '没有可应用的逐字时间',
+        hint: skipped > 0 ? '有行只打了一部分字，需要打完这一行才能应用' : '先按空格给字打时间',
+      })
+      return null
+    }
+    lyrics.lines = nextLines
+    ui.push({
+      level: 'info',
+      message: '已应用 ' + applied + ' 行的逐字时间',
+      hint: skipped > 0 ? '还有 ' + skipped + ' 行没打完，已跳过' : '导出时会带上逐字时间',
+    })
+    return { applied, skipped }
+  }
+
   /*
    * 歌词换了（新导入）时重新对齐 tapped 数组。
    *
@@ -359,6 +600,13 @@ export function useTapping() {
     () => [lyrics.lines.length, lyrics.droppedLines.length],
     () => {
       tapping.ensureSize()
+      /*
+       * 逐字草稿同样要跟着重新对齐。
+       * 【不能只在逐字模式下才做】歌词换了而逐字草稿没对齐的话，
+       * 用户下次打开逐字模式，charTargetCount 还是旧值 →
+       * charEnsureSize 会误判"没变" → 旧草稿套到新歌词上（张冠李戴）。
+       */
+      tapping.charEnsureSize()
     },
   )
 
@@ -378,9 +626,22 @@ export function useTapping() {
     apply,
     undoApply,
     undoAny,
+
+    // 逐字（增强 LRC）
+    setCharEnabled,
+    toggleChar,
+    charTap,
+    charUndo,
+    charUndoAny,
+    charRelocate,
+    charStepCursor,
+    cycleCharRate,
+    applyChars,
+
     NUDGE_STEP_MS,
     NUDGE_STEP_BIG_MS,
     APPLY_UNDO_MS,
+    CHAR_RATES,
   }
 }
 

@@ -1,4 +1,5 @@
 <script setup>
+import { computed } from 'vue'
 /**
  * 单行歌词。
  *
@@ -38,9 +39,33 @@ const props = defineProps({
    * @type {import('vue').PropType<number|null>}
    */
   opacity: { type: Number, default: null },
+  /**
+   * 逐字进度 0~1；null = 这一行没有逐字时间（不显示进度色）。
+   * @type {import('vue').PropType<number|null>}
+   */
+  charProgress: { type: Number, default: null },
 })
 
 const label = () => (props.line.empty ? '（间奏）' : props.line.text)
+
+/**
+ * 逐字进度（0~1）：这一行已经被"唱过"的比例。
+ *
+ * 【为什么由父级传进来，而不是在这里读 playerStore】
+ * 每行都订阅 currentTime 会让播放时每一帧触发 N 个组件的更新；
+ * StageView 只有一个 currentTime 依赖，算好再分发，开销是 O(1) 而不是 O(N)。
+ * 而且传值让这个组件保持纯输入，测试可以直接喂值。
+ *
+ * null 表示这一行没有逐字时间 —— 此时**不输出任何进度样式**，
+ * 渲染结果与没有逐字功能时逐字节一致。
+ */
+const progress = computed(() => {
+  const p = props.charProgress
+  if (p === null || p === undefined) return null
+  const n = Number(p)
+  if (!Number.isFinite(n)) return null
+  return Math.min(1, Math.max(0, n))
+})
 
 /** 虚化启用时用内联透明度；关闭时不设，让 CSS 类生效 */
 const style = () => {
@@ -66,7 +91,12 @@ const style = () => {
     :data-line-index="index"
     :data-opacity="opacity === null || opacity === undefined ? undefined : opacity.toFixed(4)"
   >
-    <span class="lyric-line__text">{{ label() }}</span>
+    <span
+      class="lyric-line__text"
+      :class="{ 'has-char-progress': progress !== null }"
+      :style="progress !== null ? { '--char-progress': String(progress) } : undefined"
+      :data-char-progress="progress === null ? undefined : progress.toFixed(4)"
+      >{{ label() }}</span>
   </div>
 </template>
 
@@ -252,5 +282,53 @@ const style = () => {
 /* 减少动态效果时不做缩放，避免前庭不适 */
 .reduce-motion .lyric-line.is-active {
   transform: none;
+}
+
+/*
+  逐字进度色：从左往右按进度线性覆盖。
+
+  【为什么用 background-clip:text + 渐变，而不是叠一个伪元素】
+  渐变直接在文字上"切"出两种颜色，边界就是字形本身 ——
+  不需要量文字宽度、不需要处理换行，几何天然正确。
+  伪元素方案要自己算宽度，多行换行时必然出错。
+
+  【为什么用 --char-progress 变量而不是直接算渐变】
+  进度每帧都变，写在内联样式里就是每帧重算整个 gradient 字符串；
+  用变量让浏览器只更新插值，且样式规则本身是静态的。
+
+  【null 时不生效】
+  没有逐字时间的行根本没有 has-char-progress 类，
+  下面所有规则都不匹配 —— 渲染结果与没有逐字功能时一致。
+*/
+.lyric-line__text.has-char-progress {
+  /*
+   * 双层背景，都裁到字形上：
+   *   第 1 层：进度色，只到进度停靠点，右边透明
+   *   第 2 层：当前文字色，整行铺满
+   * 上层透明处露出下层 → 已唱段是进度色，未唱段是原色。
+   *
+   * 【为什么下层用 currentColor 而不是 --lrc-color-normal】
+   * 当前行 / 刚打完行的 color 会被 .is-active / .is-tapped 改成别的颜色。
+   * currentColor 自动跟随，未唱段永远与该行"本来该有的颜色"一致 ——
+   * 写死 normal 会让高亮行的未唱段突然变成灰色。
+   */
+  background-image:
+    linear-gradient(
+      to right,
+      var(--lrc-color-char-progress) 0%,
+      var(--lrc-color-char-progress) calc(var(--char-progress) * 100%),
+      transparent calc(var(--char-progress) * 100%),
+      transparent 100%
+    ),
+    linear-gradient(currentColor, currentColor);
+  -webkit-background-clip: text, text;
+  background-clip: text, text;
+  /*
+   * 【为什么填充必须透明】
+   * 文字填充色是画在背景**之上**的。留着 currentColor 会把渐变整块盖住，
+   * 进度色一点都看不见 —— 这是 background-clip:text 最常见的踩坑点。
+   * 描边（-webkit-text-stroke）不受影响，仍然正常绘制。
+   */
+  -webkit-text-fill-color: transparent;
 }
 </style>

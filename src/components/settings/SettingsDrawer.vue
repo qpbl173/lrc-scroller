@@ -478,6 +478,22 @@ function onOpenTapping() {
           </div>
 
           <div class="field">
+            <button class="field__toggle" type="button" :aria-expanded="openPicker.charProgress" @click="togglePicker('charProgress')">
+              <span class="field__chevron" :class="{ 'is-open': openPicker.charProgress }" aria-hidden="true">▸</span>
+              逐字进度色
+              <span class="field__dot" :style="{ background: s.color.charProgress }" />
+            </button>
+            <div v-show="openPicker.charProgress" class="field__panel">
+              <ColorPicker
+                :model-value="s.color.charProgress"
+                label="逐字进度色"
+                @update:model-value="settings.set('color.charProgress', $event)"
+                @invalid="onColorInvalid('charProgress', $event)"
+              />
+            </div>
+          </div>
+
+          <div class="field">
             <button class="field__toggle" type="button" :aria-expanded="openPicker.normal" @click="togglePicker('normal')">
               <span class="field__chevron" :class="{ 'is-open': openPicker.normal }" aria-hidden="true">▸</span>
               普通行颜色

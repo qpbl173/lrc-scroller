@@ -68,8 +68,26 @@ export function readStageGeometry() {
     if (Number.isFinite(v) && v > 0) paddingRight = v
   }
   const stageWidth = Number(rect?.width)
-  // 自然宽度 = 当前宽度 + 被避让占掉的部分
-  const width = Number.isFinite(stageWidth) && stageWidth > 0 ? stageWidth + paddingRight : 0
+  /*
+   * 【什么时候才把抽屉避让量加回去】
+   * 16:9 时舞台铺满可用宽度，抽屉打开会把它挤窄，而导出不该跟着变窄
+   * （否则"开抽屉量和关抽屉导出"会得到不同换行）—— 所以要加回 padding。
+   *
+   * 竖版 / 3:4 时舞台宽度是 **比例算出来的**（见 StageView 的 aspect-ratio），
+   * 左右留白是画面的一部分，跟抽屉毫无关系。这时再加回 padding，
+   * 量出来的版心会比真实舞台宽，导出就会用错宽度算换行 —— 必须跳过。
+   *
+   * 判据直接用"舞台自己有没有声明 aspect-ratio"，而不是靠视口宽度去猜：
+   * 猜法在"窗口刚好比 stage 宽一点点"时会误判，而 aspect-ratio 是确定信号。
+   * computed 值形如 '16 / 9'；没有声明时是 'auto'。
+   */
+  let ratioDriven = false
+  if (stage && typeof getComputedStyle === 'function') {
+    const ar = String(getComputedStyle(stage).aspectRatio ?? '')
+    ratioDriven = ar !== '' && ar !== 'auto'
+  }
+  const naturalWidth = Number.isFinite(stageWidth) && stageWidth > 0 ? stageWidth + paddingRight : 0
+  const width = ratioDriven ? stageWidth : naturalWidth
 
   /*
    * 逐行高度：按 data-line-index 归位（与 useAutoScroll.measure() 的假设一致）。

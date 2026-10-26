@@ -20,6 +20,8 @@ export const CODES = {
   LRC_NEGATIVE_TIME: 'LRC_NEGATIVE_TIME',
   LRC_COUNT_MISMATCH: 'LRC_COUNT_MISMATCH',
   LRC_ENCODING_FALLBACK: 'LRC_ENCODING_FALLBACK',
+  LRC_ENHANCED_DROPPED: 'LRC_ENHANCED_DROPPED',
+  LRC_ENHANCED_MISMATCH: 'LRC_ENHANCED_MISMATCH',
   // 音频
   AUDIO_DECODE_FAIL: 'AUDIO_DECODE_FAIL',
   AUDIO_NOT_LOADED: 'AUDIO_NOT_LOADED',
@@ -92,6 +94,16 @@ const TEMPLATES = {
     level: 'info',
     message: '已按 GBK 编码读取歌词',
     hint: '原文件不是 UTF-8，已自动兼容，中文应显示正常。',
+  },
+  [CODES.LRC_ENHANCED_DROPPED]: {
+    level: 'warn',
+    message: '有行的逐字时间无法读取，已按整行歌词显示',
+    hint: '这些行的 <mm:ss.xx> 标签写得不规范（例如超出 59 秒）。歌词文字没有丢失，但这一行不会有逐字高亮。',
+  },
+  [CODES.LRC_ENHANCED_MISMATCH]: {
+    level: 'warn',
+    message: '有行的逐字时间与歌词字数对不上',
+    hint: '已保留解析出来的逐字时间。若高亮位置看着不对，可在打轴模式里重新对齐这一行。',
   },
   [CODES.AUDIO_DECODE_FAIL]: {
     level: 'error',

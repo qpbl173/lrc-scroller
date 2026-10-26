@@ -85,6 +85,14 @@ button:disabled {
   position: relative;
   min-height: 0;
   overflow: hidden;
+  /*
+   * 舞台外壳（.stage-frame）用 height:100% 撑满这一格。
+   * grid 的隐式行高默认是 auto，不给 minmax(0, 1fr) 时
+   * 100% 会去解析一个"由内容决定的高度"，竖版舞台就会塌成一条线。
+   */
+  display: grid;
+  grid-template-rows: minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr);
 }
 
 /* —— 阶段 4：展示 / 全屏模式 —— */

@@ -57,8 +57,16 @@ export const TUTORIAL_STEPS = [
     place: 'top',
   },
   {
+    id: 'bilingual',
+    title: '第 3 步 · 双语歌词：调换上下行',
+    body: '左侧歌词信息面板里能调双语歌词：选「放大哪一行」决定原文还是翻译更大，点「调换上下行内容」把两者的正文互换。',
+    hint: '面板默认收起，先点一下左上角的「歌词信息」把它展开。只有同一时间的双行歌词（双语）才会出现这一块。',
+    targets: ['[data-tour="bilingual"]', '[data-tour="lyrics-info"]'],
+    place: 'bottom',
+  },
+  {
     id: 'settings',
-    title: '第 3 步 · 自定义你的画面',
+    title: '第 4 步 · 自定义你的画面',
     body: '点「设置」可以调整字体、字号、行距、字间距、颜色、背景和虚化效果。',
     hint: '改动会立刻反映到画面上，并自动保存在本机浏览器里。',
     targets: ['[data-tour="settings"]'],
@@ -66,8 +74,8 @@ export const TUTORIAL_STEPS = [
   },
   {
     id: 'export',
-    title: '第 4 步 · 导出视频',
-    body: '在设置面板里点「导出」，选好分辨率和帧率，再点「导出视频」就能拿到 MP4。',
+    title: '第 5 步 · 导出视频',
+    body: '在设置面板里点「导出」，选好画布比例、分辨率和帧率，再点「导出视频」就能拿到 MP4。',
     hint: '导出的是无声视频，音频请在自己的剪辑软件里对齐。',
     // 抽屉开着就指向真正的按钮，否则回落到「设置」（用户选了不自动开抽屉）
     targets: ['[data-tour="export-video"]', '[data-tour="export-toggle"]', '[data-tour="settings"]'],

@@ -85,6 +85,52 @@ function onApplyTapping() {
   tappingAPI.apply()
 }
 
+// ── 逐字打轴（增强 LRC）──────────────────────
+
+/**
+ * 逐字模式开关。
+ *
+ * 【与「打轴」按钮并列，而不是二合一】
+ * 两套草稿是并存的（先逐行打完时间轴，再挑几行逐字精修），
+ * 合成一个按钮的话，用户切模式就会以为前一份草稿被丢了。
+ * 两个独立开关能把这个事实直接摆在界面上。
+ */
+function onToggleChar() {
+  tappingAPI.toggleChar()
+}
+
+function onApplyChars() {
+  tappingAPI.applyChars()
+}
+
+/** 逐字模式下 ←/→ 挪光标（按钮版，供触摸设备用） */
+function onCharStep(dir) {
+  tappingAPI.charStepCursor(dir)
+}
+
+/** 逐字倍速：只在 0.5/0.75/1/1.25/1.5 五档里循环 */
+function cycleCharRate() {
+  tappingAPI.cycleCharRate(1)
+}
+
+/** 当前逐字行的字表长度（未拆字时为 0） */
+const charLineTotal = computed(() => tapping.charChars.length)
+
+/** 当前行内已打字数 */
+const charLineTimed = computed(() => tapping.charTimedCount)
+
+/** 逐字可应用的行数（每个字都有时间才算完整） */
+const charApplicableCount = computed(() => {
+  const drafts = tapping.charDraft
+  let n = 0
+  for (const key of Object.keys(drafts)) {
+    const chars = drafts[key]
+    if (!Array.isArray(chars) || chars.length === 0) continue
+    if (chars.every((ch) => ch && Number.isFinite(ch.t))) n++
+  }
+  return n
+})
+
 // ── 进度条：三段式拖动 ──────────────────────────
 /**
  * 开启一次进度条拖动会话。
@@ -205,6 +251,65 @@ function cycleRate() {
       应用到歌词
     </button>
 
+    <!-- 逐字打轴开关（增强 LRC）。与「打轴」并列：两套草稿并存 -->
+    <button
+      class="playerbar__tap playerbar__char"
+      :class="{ 'is-on': tapping.charMode }"
+      type="button"
+      :aria-label="tapping.charMode ? '退出逐字打轴' : '进入逐字打轴'"
+      :aria-pressed="tapping.charMode"
+      title="逐字打轴：空格给当前字打时间点（标点跟随前一个字）"
+      @click="onToggleChar"
+    >
+      逐字
+    </button>
+
+    <!--
+      逐字模式下的操作条：倍速 + 光标 + 进度。
+      整块只在逐字模式显示 —— 非逐字时它一个字的信息都没有，
+      留着只会把播放条挤满（窄屏尤其明显）。
+    -->
+    <template v-if="tapping.charMode">
+      <button
+        class="playerbar__tap playerbar__char-rate"
+        type="button"
+        :aria-label="`逐字打轴倍速 ${rate} 倍，点击切换`"
+        title="逐字打轴倍速（只用 0.5/0.75/1/1.25/1.5，慢速更好跟）"
+        @click="cycleCharRate"
+      >
+        {{ rate }}×
+      </button>
+
+      <button
+        class="playerbar__tap playerbar__char-step"
+        type="button"
+        aria-label="光标退一个字"
+        title="← 光标退一个字（重打打错的字）"
+        @click="onCharStep(-1)"
+      >
+        ←
+      </button>
+      <button
+        class="playerbar__tap playerbar__char-step"
+        type="button"
+        aria-label="光标进一个字"
+        title="→ 光标进一个字"
+        @click="onCharStep(1)"
+      >
+        →
+      </button>
+
+      <button
+        v-if="charApplicableCount > 0"
+        class="playerbar__tap playerbar__apply"
+        type="button"
+        :title="`把 ${charApplicableCount} 行的完整逐字时间应用到歌词`"
+        @click="onApplyChars"
+      >
+        应用逐字
+      </button>
+    </template>
+
     <!--
       "打轴中"标记。
       需求明确要求开启后有可见标记 —— 否则用户忘了自己开着模式，
@@ -228,6 +333,18 @@ function cycleRate() {
     -->
     <span v-if="editingBeat !== null" class="playerbar__beat">
       第 {{ editingBeat + 1 }} 拍
+    </span>
+
+    <!--
+      逐字进度标记：第几行 / 共几行 + 行内已打字数。
+      与逐行的「打轴中 N/M」并列存在时可能同时出现（两套草稿并存），
+      所以文案必须能区分，不能都叫"打轴中"。
+    -->
+    <span v-if="tapping.charMode" class="playerbar__tapping playerbar__char-progress" role="status">
+      <template v-if="charLineTotal > 0">
+        逐字 {{ tapping.charLineIndex + 1 }}/{{ tappingTotal }} · {{ charLineTimed }}/{{ charLineTotal }} 字
+      </template>
+      <template v-else>逐字 · 该行无字可打</template>
     </span>
 
     <span class="playerbar__time">{{ timeText }}</span>
@@ -292,8 +409,19 @@ function cycleRate() {
       </div>
     </div>
 
-    <!-- 倍速 -->
-    <button class="btn btn--ghost btn--icon playerbar__rate" type="button" aria-label="播放速度" @click="cycleRate">
+    <!--
+      倍速。
+      逐字模式下换成上面那个 char-rate 按钮：播放器的档位含 2x，
+      而 2x 打逐字根本跟不上，两个按钮同时存在还会互相打架
+      （点一个换档，另一个的显示跟着变，用户会以为点错了）。
+    -->
+    <button
+      v-if="!tapping.charMode"
+      class="btn btn--ghost btn--icon playerbar__rate"
+      type="button"
+      aria-label="播放速度"
+      @click="cycleRate"
+    >
       {{ rate }}×
     </button>
 
@@ -384,6 +512,36 @@ function cycleRate() {
   font-size: 11px;
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
+}
+
+/* ── 逐字打轴（增强 LRC）────────────────── */
+
+/*
+ * 逐字开关与逐行开关长得一样（复用 .playerbar__tap），
+ * 只加一个色相区分：逐字是"更细的一层"，用青色而不是强调蓝，
+ * 免得用户把两个按钮看串（它们紧挨着）。
+ */
+.playerbar__char.is-on {
+  border-color: #2ec4b6;
+  background: color-mix(in srgb, #2ec4b6 22%, transparent);
+  color: #2ec4b6;
+}
+
+/* 逐字模式下的倍速与光标按钮：比开关更窄，不抢视觉重心 */
+.playerbar__char-rate,
+.playerbar__char-step {
+  padding: 4px 7px;
+  font-variant-numeric: tabular-nums;
+}
+
+.playerbar__char-step {
+  min-width: 26px;
+  text-align: center;
+}
+
+/* 逐字进度标记：与逐行进度同色，但内容不同（字数 vs 行数） */
+.playerbar__char-progress {
+  color: #2ec4b6;
 }
 
 /* 当前编辑行的节拍序号 */
@@ -530,6 +688,20 @@ function cycleRate() {
    */
   .playerbar__tap,
   .playerbar__tapping {
+    display: none;
+  }
+
+  /*
+   * 窄屏同样藏掉逐字那一组（开关/倍速/光标/应用/进度）。
+   * 理由与上面一致：播放条在 375px 下已经溢出。
+   * 逐字仍可用快捷键（T 切逐行、逐字开关走设置抽屉），
+   * 功能不受影响；应用逐字这一步窄屏上确实没有按钮入口，
+   * 这是有意的取舍 —— 逐字精修本来就不适合手机屏。
+   */
+  .playerbar__char,
+  .playerbar__char-rate,
+  .playerbar__char-step,
+  .playerbar__char-progress {
     display: none;
   }
 }

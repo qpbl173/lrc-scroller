@@ -10,9 +10,16 @@
  * 产出的 MP4 **不含音频轨** —— 音频由用户在自己的剪辑软件里对齐。
  * 「渲染当前帧」/「渲染全部帧」是预览（只画不编码），「导出视频」才真的产出文件。
  *
- * 【分辨率与帧率由用户选】
- * 480p / 720p / 1080p / 2K / 4K，24 / 30 / 60 帧。
- * 分辨率与帧率都写进 settings.export，因此会被持久化（刷新后仍是用户选的那档）。
+ * 【画布比例、分辨率与帧率都由用户选】
+ * 比例：16:9 横屏 / 9:16 竖屏 / 3:4 竖版。
+ * 分辨率：480p / 720p / 1080p / 2K / 4K（按"短边"命名，竖版 1080p 即 1080×1920）。
+ * 帧率：24 / 30 / 60。
+ * 三者都写进 settings.export，因此会被持久化（刷新后仍是用户选的那档）。
+ *
+ * 【比例是"渲染参数"，不只是导出参数】
+ * 舞台（.stage）自己会按这个比例收窄，预览看到的就是导出会得到的构图。
+ * 预览与导出共用 core/renderFrame，几何都来自 core/stageGeometry 的实测值，
+ * 所以这里改一下比例，两边同时变 —— 不存在"预览竖屏、导出横屏"的可能。
  */
 import { computed, onMounted, ref, watch } from 'vue'
 import { usePlayerStore } from '@/stores/playerStore'
@@ -20,7 +27,14 @@ import { useSettingsStore } from '@/stores/settingsStore'
 import { useLyricsStore } from '@/stores/lyricsStore'
 import { useVideoExportShared, DEFAULT_FPS } from '@/composables/useVideoExport'
 import { useLrcExportShared } from '@/composables/useLrcExport'
-import { RESOLUTION_PRESETS, FPS_PRESETS, findResolution } from '@/core/settings'
+import {
+  ASPECT_PRESETS,
+  DEFAULT_ASPECT,
+  FPS_PRESETS,
+  findAspect,
+  findResolution,
+  resolutionPresetsFor,
+} from '@/core/settings'
 import { summarizeLrcLines } from '@/core/lrcWriter'
 
 const player = usePlayerStore()
@@ -77,31 +91,36 @@ const controller = ref(null)
  */
 const codecState = ref(/** @type {'probing'|'supported'|'unsupported'} */ ('probing'))
 
+/** 当前选中的画布比例 */
+const aspect = computed(() => settings.settings.export?.aspect ?? DEFAULT_ASPECT)
+const aspectInfo = computed(() => findAspect(aspect.value))
+/** 当前比例下可选的分辨率档位（16:9 与竖版是两张不同的尺寸表） */
+const resolutions = computed(() => resolutionPresetsFor(aspect.value))
 /** 当前选中的分辨率预设 */
 const resolution = computed(() => settings.settings.export?.resolution ?? '720p')
-const size = computed(() => findResolution(resolution.value))
+const size = computed(() => findResolution(resolution.value, aspect.value))
 const fpsi = computed(() => {
   const v = Number(settings.settings.export?.fps)
   return v > 0 ? v : DEFAULT_FPS
 })
 
-/** 用户没显式改过码率（仍是默认 8）时，显示按分辨率推荐的值 */
+/** 用户没显式改过码率（仍是默认 8）时，显示按像素量推荐的值 */
 const bitrate = computed(() => {
   const configured = Number(settings.settings.export?.bitrateMbps)
-  return configured > 0 && configured !== 8 ? configured : exporter.recommendBitrate(size.value.height)
+  return configured > 0 && configured !== 8
+    ? configured
+    : exporter.recommendBitrate(size.value.height, size.value.width)
 })
 
 /**
  * 把画布尺寸同步到所选分辨率。
  * 必须在渲染前完成，否则编码器配置与实际画布不一致会直接失败。
+ *
+ * 尺寸计算只有一处实现（exporter.ensureCanvasSize），面板不再自己写一遍 ——
+ * 两处各写一遍最容易出的错是"预览画布横版、编码器竖版"，且报错信息毫无指向。
  */
 function syncCanvasSize() {
-  const c = canvasRef.value
-  if (!c) return
-  if (c.width !== size.value.width || c.height !== size.value.height) {
-    c.width = size.value.width
-    c.height = size.value.height
-  }
+  exporter.ensureCanvasSize(canvasRef.value, size.value)
 }
 
 /**
@@ -128,8 +147,8 @@ onMounted(async () => {
   await probe()
 })
 
-// 换分辨率或帧率都要重新探测：编码器对分辨率/帧率的支持并不一致
-watch([resolution, fpsi], async () => {
+// 换比例、分辨率或帧率都要重新探测：编码器对尺寸/帧率的支持并不一致
+watch([aspect, resolution, fpsi], async () => {
   codecState.value = 'probing'
   lastRendered.value = null
   syncCanvasSize()
@@ -160,7 +179,7 @@ const progressText = computed(() => {
 
 function onRenderFrame() {
   syncCanvasSize()
-  const ok = exporter.renderPreview(canvasRef.value, player.currentTime)
+  const ok = exporter.renderPreview(canvasRef.value, player.currentTime, size.value)
   if (ok) lastRendered.value = player.currentTime
 }
 
@@ -244,8 +263,32 @@ function onCancel() {
 
 <template>
   <div class="export-panel">
-    <!-- 分辨率 / 帧率：改完立刻反映到画布与编码探测 -->
+    <!-- 比例 / 分辨率 / 帧率：改完立刻反映到舞台、画布与编码探测 -->
     <div class="export-panel__settings">
+      <!--
+        画布比例排在第一位，因为它决定了分辨率那张表的内容。
+        【同一档位的 id 在两种比例下尺寸不同】
+        16:9 的 1080p 是 1920×1080，9:16 的 1080p 是 1080×1920 ——
+        用户的"档位选择"（1080p）保持不变，只有尺寸随比例重算，
+        所以这里**不需要也不应该**重置分辨率：换比例就丢档位会很反直觉。
+        真正的尺寸永远只有 findResolution(resolution, aspect) 一个出处，
+        下拉里展示的尺寸也来自同一个函数（resolutionPresetsFor）。
+      -->
+      <label class="export-panel__field export-panel__field--full">
+        <span class="export-panel__label">画布比例</span>
+        <select
+          class="export-panel__control"
+          :value="aspect"
+          :disabled="rendering"
+          data-tour="export-aspect"
+          @change="settings.set('export.aspect', $event.target.value)"
+        >
+          <option v-for="a in ASPECT_PRESETS" :key="a.id" :value="a.id">
+            {{ a.label }}（{{ a.width }}:{{ a.height }}）
+          </option>
+        </select>
+      </label>
+
       <label class="export-panel__field">
         <span class="export-panel__label">分辨率</span>
         <select
@@ -254,7 +297,7 @@ function onCancel() {
           :disabled="rendering"
           @change="settings.set('export.resolution', $event.target.value)"
         >
-          <option v-for="p in RESOLUTION_PRESETS" :key="p.id" :value="p.id">
+          <option v-for="p in resolutions" :key="p.id" :value="p.id">
             {{ p.label }}（{{ p.width }}×{{ p.height }}）
           </option>
         </select>
@@ -274,8 +317,8 @@ function onCancel() {
     </div>
 
     <p class="export-panel__note">
-      画布 {{ size.width }}×{{ size.height }} · {{ fpsi }} 帧 · 约 {{ bitrate }} Mbps
-      ——画面按预览舞台等比缩放，动效、行距、字距、字体与配色都与预览一致。
+      画布 {{ size.width }}×{{ size.height }}（{{ aspectInfo.label }}）· {{ fpsi }} 帧 · 约
+      {{ bitrate }} Mbps——画面按预览舞台等比缩放，动效、行距、字距、字体与配色都与预览一致。
     </p>
 
     <!--
@@ -392,6 +435,16 @@ function onCancel() {
   gap: 4px;
 }
 
+/*
+ * 独占一行的字段（画布比例）。
+ * 抽屉只有 360px，三个下拉并排每个不到 110px，
+ * 「9:16（1080×1920）」这种选项文字会被截断成看不出来。
+ * 比例又是最容易选错、最该一眼看清的项，所以让它单独占一行。
+ */
+.export-panel__field--full {
+  flex: 1 1 100%;
+}
+
 .export-panel__label {
   color: var(--ui-text-dim);
   font-size: var(--ui-font-xs);
@@ -435,9 +488,18 @@ function onCancel() {
   height: 10px;
 }
 
+/*
+ * 预览画布：按比例摆放，不强制铺满。
+ * width:100% + height:auto 会让竖版画布变成一个很高的长条（1080×1920 在 360px 抽屉里
+ * 有 640px 高），把整个面板顶得老长。改成按比例收缩到抽屉内、并且限高，
+ * 竖版就是一个比例正确的缩略图，不再是"一眼看不全"的柱子。
+ */
 .export-panel__canvas {
-  width: 100%;
+  display: block;
+  width: auto;
   height: auto;
+  max-width: 100%;
+  max-height: 320px;
   border: 1px solid var(--ui-border);
   border-radius: var(--ui-radius-sm);
   background: #000;

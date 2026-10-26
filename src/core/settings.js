@@ -46,6 +46,15 @@ export function createDefaultSettings() {
        * 蓝色也符合"刚操作完/待确认"的直觉。
        */
       tapped: '#4c8dff',
+      /**
+       * 逐字进度色：已唱过的那部分字符（从左往右线性推进）。
+       *
+       * 【为什么默认与 tapped 同为 accent 蓝】
+       * 进度色表达的是"已经唱到这里"，与"刚打完轴"是两种不同的蓝色语义，
+       * 但用户第一眼最需要的是能看见进度 —— 深色背景下灰色看不清，
+       * 白色又会与 active 混淆，所以默认沿用 accent 蓝，允许单独改色。
+       */
+      charProgress: '#4c8dff',
       bg: '#0b0e14',
       bgMode: 'solid', // solid | green | black
     },
@@ -130,7 +139,12 @@ export function createDefaultSettings() {
     },
 
     export: {
-      /** 分辨率 preset id：480p | 720p | 1080p | 2k | 4k（见 RESOLUTION_PRESETS） */
+      /** 画布比例 id：16:9 | 9:16 | 3:4（见 ASPECT_PRESETS） */
+      aspect: '16:9',
+      /**
+       * 分辨率 preset id：480p | 720p | 1080p | 2k | 4k。
+       * 具体尺寸由"比例 + 档位"现算（resolutionPresetsFor），竖版 1080p 是 1080×1920。
+       */
       resolution: '720p',
       width: 1280,
       height: 720,
@@ -143,13 +157,36 @@ export function createDefaultSettings() {
 }
 
 /**
+ * 导出画布比例预设。
+ *
+ * 【为什么比例要单独成一层，而不是塞进分辨率】
+ * 预览舞台现在按"用户选的画布比例"做等比适配（见 StageView 的 --stage-aspect），
+ * 导出则用同一份比例生成画布。比例一旦不同，换行位置、行高、滚动位移全都不同，
+ * 所以它必须是一个**显式设置**，而不是从窗口尺寸临时推出来的东西 ——
+ * 否则换台机器 / 换个窗口大小，导出的画面就跟预览对不上了。
+ *
+ * id 是展示与持久化用的字符串；真正参与计算的是 width:height 两个整数，
+ * 保留为 16 / 9 这样的约分形式，避免 1.7778… 的浮点误差渗进布局公式。
+ */
+export const ASPECT_PRESETS = [
+  { id: '16:9', label: '横屏 16:9', width: 16, height: 9 },
+  { id: '9:16', label: '竖屏 9:16', width: 9, height: 16 },
+  { id: '3:4', label: '竖版 3:4', width: 3, height: 4 },
+]
+
+/** 默认画布比例（找不到时一律回落到它） */
+export const DEFAULT_ASPECT = '16:9'
+
+/**
  * 导出分辨率预设。
  *
- * 【为什么成品率由"短边"决定】
+ * 【为什么档位由"短边"决定】
  * 16:9 下 480p/720p/1080p/2K/4K 的高度分别是 480/720/1080/1440/2160。
- * 预览舞台的宽高比会随窗口变化，导出统一按 16:9 输出，
- * 横向按预览舞台的宽高比等比缩放并居中补边（见 renderFrame 的版心逻辑），
- * 因此无论窗口多宽，换行位置都与预览一致。
+ * 竖版（9:16 / 3:4）的"短边"是宽度，所以按短边命名：1080×1920 就是 1080p。
+ * 这样"1080p"在不同比例下表示的是同一档清晰度，而不是同一个高度。
+ *
+ * 预览舞台的宽高比跟着 export.aspect 走，导出也按同一比例生成画布，
+ * 因此换行位置在任何比例下都与预览一致（见 renderFrame 的版心逻辑）。
  */
 export const RESOLUTION_PRESETS = [
   { id: '480p', label: '480p', width: 854, height: 480 },
@@ -158,6 +195,89 @@ export const RESOLUTION_PRESETS = [
   { id: '2k', label: '2K', width: 2560, height: 1440 },
   { id: '4k', label: '4K', width: 3840, height: 2160 },
 ]
+
+/**
+ * 竖版分辨率预设（9:16 与 3:4 共用一张表）。
+ *
+ * 【为什么 9:16 和 3:4 能共用】
+ * 竖版的分辨率档位看的是**短边**（也就是宽度）：1080 宽在 9:16 下是 1080×1920，
+ * 在 3:4 下是 1080×1440。两档共享同一组短边值，只是长边按比例换算，
+ * 用户切换比例时分辨率档位不会突然失效，也少维护一张表。
+ *
+ * 尺寸约定（短边 = 宽，长边 = 宽 × 比例，即"竖起来的同名档位"）：
+ *  - 9:16 → 1080p 是 1080×1920
+ *  - 3:4  → 1080p 是 1080×1440，480p 是 480×640
+ * 全部是 4 的倍数：H.264 编码器普遍要求偶数，4 的倍数在部分硬件编码器上更稳。
+ */
+const VERTICAL_SHORT_SIDES = [
+  { id: '480p', label: '480p', short: 480 },
+  { id: '720p', label: '720p', short: 720 },
+  { id: '1080p', label: '1080p', short: 1080 },
+  { id: '2k', label: '2K', short: 1440 },
+  { id: '4k', label: '4K', short: 2160 },
+]
+
+/**
+ * 按比例算出"全部可选分辨率"。
+ *
+ * 16:9 直接返回 RESOLUTION_PRESETS（它就是历史表，尺寸不能动 ——
+ * 改了会让老设置的成品尺寸悄悄变化）。其余比例按短边现算，保证：
+ *  - 全部是 4 的倍数（H.264 的编码器对奇数尺寸很不友好）
+ *  - 宽高比与 ASPECT_PRESETS 里声明的 16/9、3/4 **完全相等**，不是近似
+ *
+ * @param {string} aspectId
+ * @returns {{id:string,label:string,width:number,height:number,aspect:string}[]}
+ */
+export function resolutionPresetsFor(aspectId) {
+  const aspect = findAspect(aspectId)
+  if (aspect.id === DEFAULT_ASPECT) {
+    return RESOLUTION_PRESETS.map((p) => ({ ...p, aspect: aspect.id }))
+  }
+  return VERTICAL_SHORT_SIDES.map((entry) => {
+    const short = entry.short
+    // 短边固定是宽（竖版），长边 = 短边 × 比例，再补齐到 4 的倍数
+    const long = roundTo4((short * aspect.height) / aspect.width)
+    return { id: entry.id, label: entry.label, width: short, height: long, aspect: aspect.id }
+  })
+}
+
+/** 补齐到最近的 4 的倍数（编码器友好，且不改变比例到肉眼可辨的程度） */
+function roundTo4(n) {
+  const v = Math.round(Number(n))
+  if (!Number.isFinite(v) || v <= 0) return 0
+  return Math.max(4, Math.round(v / 4) * 4)
+}
+
+/**
+ * 按 id 取画布比例；未知 id 回落 16:9。
+ * @param {string} id
+ */
+export function findAspect(id) {
+  return ASPECT_PRESETS.find((p) => p.id === id) ?? ASPECT_PRESETS[0]
+}
+
+/**
+ * 按画布尺寸反推它属于哪个比例（取比值最接近的一档）。
+ * @param {number} width
+ * @param {number} height
+ * @returns {string}
+ */
+export function aspectOfSize(width, height) {
+  const w = Number(width)
+  const h = Number(height)
+  if (!Number.isFinite(w) || !Number.isFinite(h) || w <= 0 || h <= 0) return DEFAULT_ASPECT
+  const ratio = w / h
+  let best = ASPECT_PRESETS[0]
+  let bestDiff = Infinity
+  for (const p of ASPECT_PRESETS) {
+    const d = Math.abs(ratio - p.width / p.height)
+    if (d < bestDiff) {
+      bestDiff = d
+      best = p
+    }
+  }
+  return best.id
+}
 
 /** 导出帧率预设 */
 export const FPS_PRESETS = [
@@ -168,15 +288,26 @@ export const FPS_PRESETS = [
 
 /**
  * 按 id 取分辨率预设；未知 id 回落到 720p。
+ *
+ * 带 aspect 参数时在该比例的候选表里找（竖版 1080p 是 1080×1920 而不是 1920×1080），
+ * 不带时在 16:9 表里找 —— 保持老调用的行为不变。
+ *
  * @param {string} id
+ * @param {string} [aspectId]
  * @returns {{id:string,label:string,width:number,height:number}}
  */
-export function findResolution(id) {
-  return RESOLUTION_PRESETS.find((p) => p.id === id) ?? RESOLUTION_PRESETS[1]
+export function findResolution(id, aspectId) {
+  const list = aspectId ? resolutionPresetsFor(aspectId) : resolutionPresetsFor(DEFAULT_ASPECT)
+  return list.find((p) => p.id === id) ?? list[1] ?? list[0]
 }
 
 /**
  * 按画布高宽推断最接近的分辨率 preset id（用于设置面板回显）。
+ *
+ * 先用 aspectOfSize 判断这个尺寸属于哪个比例，再在该比例的候选表里找最近的档位。
+ * 反查通常发生在导入/迁移场景（只有尺寸、没有比例），所以判比例这一步必须内置，
+ * 否则 1080×1920 会被当成"比 2K 横屏矮一截"而错配到 1440p。
+ * 确定档位之后，精确尺寸仍要用 findResolution(id, aspect) 取 —— 那才是唯一出处。
  * @param {number} width
  * @param {number} height
  * @returns {string}
@@ -185,9 +316,10 @@ export function nearestResolutionId(width, height) {
   const w = Number(width)
   const h = Number(height)
   if (!Number.isFinite(w) || !Number.isFinite(h) || h <= 0) return '720p'
-  let best = RESOLUTION_PRESETS[1]
+  const aspectId = aspectOfSize(w, h)
+  let best = findResolution('720p', aspectId)
   let bestDiff = Infinity
-  for (const p of RESOLUTION_PRESETS) {
+  for (const p of resolutionPresetsFor(aspectId)) {
     const d = Math.abs(p.height - h) + Math.abs(p.width - w)
     if (d < bestDiff) {
       bestDiff = d
@@ -195,6 +327,17 @@ export function nearestResolutionId(width, height) {
     }
   }
   return best.id
+}
+
+/**
+ * 把画布比例算成 CSS 的 aspect-ratio 值（形如 '9 / 16'）。
+ * 预览舞台直接吃这个值做等比适配，导出再用同一份比例生成画布，
+ * 两边共用一处来源，不存在"CSS 写 9/16、导出写 0.5625"的漂移。
+ * @param {string} aspectId
+ */
+export function aspectCssValue(aspectId) {
+  const p = findAspect(aspectId)
+  return `${p.width} / ${p.height}`
 }
 
 /**
@@ -221,8 +364,9 @@ export const FIELD_META = {
   'fade.solidAbove': { min: 0, max: 20, step: 1, unit: '行' },
   'fade.solidBelow': { min: 0, max: 20, step: 1, unit: '行' },
   'fade.fadeRows': { min: 0, max: 30, step: 1, unit: '行' },
+  // 上限按最长边的最大预设走：4K 横屏宽 3840、4K 竖屏高 3840，两者都要能存下来
   'export.width': { min: 320, max: 3840, step: 2, unit: 'px' },
-  'export.height': { min: 240, max: 2160, step: 2, unit: 'px' },
+  'export.height': { min: 240, max: 3840, step: 2, unit: 'px' },
   'export.fps': { min: 10, max: 60, step: 1, unit: 'fps' },
   'export.bitrateMbps': { min: 1, max: 50, step: 1, unit: 'Mbps' },
 }
@@ -297,6 +441,7 @@ export function sanitizeSettings(raw) {
   out.color.normal = normalizeColor(pick(raw, 'color.normal', d.color.normal), d.color.normal)
   out.color.active = normalizeColor(pick(raw, 'color.active', d.color.active), d.color.active)
   out.color.tapped = normalizeColor(pick(raw, 'color.tapped', d.color.tapped), d.color.tapped)
+  out.color.charProgress = normalizeColor(pick(raw, 'color.charProgress', d.color.charProgress), d.color.charProgress)
   out.color.bg = normalizeColor(pick(raw, 'color.bg', d.color.bg), d.color.bg)
   out.color.bgMode = pickEnum(pick(raw, 'color.bgMode', d.color.bgMode), ['solid', 'green', 'black'], d.color.bgMode)
 
@@ -328,9 +473,14 @@ export function sanitizeSettings(raw) {
   out.sync.firstBeatMs = pick(raw, 'sync.firstBeatMs', d.sync.firstBeatMs)
   out.sync.snap = pickEnum(pick(raw, 'sync.snap', d.sync.snap), ['none', 'nearest', 'next'], d.sync.snap)
 
+  out.export.aspect = pickEnum(
+    pick(raw, 'export.aspect', d.export.aspect),
+    ASPECT_PRESETS.map((p) => p.id),
+    d.export.aspect,
+  )
   out.export.resolution = pickEnum(
     pick(raw, 'export.resolution', d.export.resolution),
-    RESOLUTION_PRESETS.map((p) => p.id),
+    resolutionPresetsFor(out.export.aspect).map((p) => p.id),
     d.export.resolution,
   )
   out.export.width = pick(raw, 'export.width', d.export.width)
@@ -441,6 +591,7 @@ export function toCssVars(s) {
     '--lrc-color-normal': s.color.normal,
     '--lrc-color-active': s.color.active,
     '--lrc-color-tapped': s.color.tapped,
+    '--lrc-color-char-progress': s.color.charProgress,
     // 描边：宽度是 em 值（相对字号），颜色已经过「明亮」换算
     '--lrc-stroke-width': `${s.stroke.width}em`,
     '--lrc-stroke-color': resolveStrokeColor(s),
