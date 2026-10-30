@@ -16,6 +16,12 @@
  *   motion.scrollMode（center / golden 锚点）/ reduceMotion（不做动效）
  *   fade.*（交给 core/fade.js，与预览同一个函数）
  *
+ * 【"当前行"是逻辑行，不是单个物理行】
+ * 双语歌词里原文与翻译是同一时间的两个物理行，预览的 .is-active 打在**整组**上
+ * （StageView.isActiveRow 用 buildLogicalRows 归并）。所以这里判定当前行也用
+ * logicalRowRange 展开整组 —— 只认一个下标会让"变大变色的那一行"从原文变成翻译行。
+ * 详见 logicalRowRange 的说明。
+ *
  * 【为什么行几何要"逐行算"而不是一个统一 lineH】
  * 预览的 useAutoScroll.measure() 读的是每一行的 offsetTop/offsetHeight，
  * 而**自动换行的行长高了**（`.lyric-line__text` 有 max-width + break-word）。
@@ -449,10 +455,41 @@ export function rgbaOf(c, alpha) {
 }
 
 /**
+ * 取第 `index` 行所属的「逻辑行」—— 即**时间完全相同的整组物理行**（原文 + 翻译）。
+ *
+ * 【为什么导出必须按整组判"当前行"】
+ * 预览的 .is-active 是打在整组上的：StageView 的 isActiveRow() 用
+ * fade.js 的 buildLogicalRows 归并，同一时间的原文与翻译**一起**变色、一起放大
+ * （见 StageView.vue「双语歌词的"放大"必须按逻辑行算」那段说明）。
+ *
+ * 导出若只认 `i === cur` 这一个下标，双语组里就只有一行被高亮 ——
+ * 而 findLineIndexAt 返回的是该组**最后一个**下标，于是：
+ *   · 组内顺序是「原文、翻译」时 → 放大+变色的是**翻译行**，原文反而不动；
+ *   · 组内顺序是「翻译、原文」时 → 原文的放大对，但翻译行不会跟着变色。
+ * 两种都是"导出 ≠ 预览"，用户看到的就是"导出时翻译行变大并且变色"。
+ *
+ * @param {Array<{t:number}>} lines
+ * @param {number} index
+ * @returns {{start:number, end:number}} 闭区间；下标非法时返回 {-1,-1}（不匹配任何行）
+ */
+export function logicalRowRange(lines, index) {
+  const arr = Array.isArray(lines) ? lines : []
+  const i = Number(index)
+  if (!Number.isInteger(i) || i < 0 || i >= arr.length) return { start: -1, end: -1 }
+
+  const t = arr[i]?.t
+  let start = i
+  let end = i
+  while (start > 0 && arr[start - 1]?.t === t) start--
+  while (end < arr.length - 1 && arr[end + 1]?.t === t) end++
+  return { start, end }
+}
+
+/**
  * 找出"切换前的当前行"。
  *
- * 同时间的多行（原文 + 翻译）里只有最后一行是 is-active，
- * 所以要跳过整组同时间的行，取**时间严格更小**的最后一行。
+ * 返回的是**上一组的最后一个下标**（该组自身也被跳过），
+ * 组内其余行由 logicalRowRange 展开 —— 换行过渡时整组一起缩回。
  *
  * @param {Array<{t:number}>} lines
  * @param {number} cur
@@ -938,6 +975,14 @@ const charProgressColor = settings?.color?.charProgress ?? '#4c8dff'
     return charProgressAt(line.chars, t)
   }
 
+  /*
+   * 当前行 / 上一行都是**逻辑行**（同时间的整组物理行），不是单个下标 ——
+   * 预览的 .is-active 打在整组上，导出必须逐行展开才算对齐。
+   * 详见 logicalRowRange 的说明。
+   */
+  const activeRange = hasActive ? logicalRowRange(lines, cur) : { start: -1, end: -1 }
+  const prevRange = trans.prev >= 0 ? logicalRowRange(lines, trans.prev) : { start: -1, end: -1 }
+  const inRange = (i, r) => i >= r.start && i <= r.end
 
   for (let i = 0; i < rows.length; i++) {
     const row = rows[i]
@@ -950,8 +995,8 @@ const charProgressColor = settings?.color?.charProgress ?? '#4c8dff'
     // 完全在画布外就不必画（长歌词下能省掉大量 fillText）
     if (cy + row.height < 0 || cy - row.height > H) continue
 
-    const isActive = hasActive && i === cur
-    const isOutgoing = trans.prev >= 0 && i === trans.prev && trans.scaleProg < 1
+    const isActive = inRange(i, activeRange)
+    const isOutgoing = trans.scaleProg < 1 && inRange(i, prevRange)
 
     if (isActive) {
       /*

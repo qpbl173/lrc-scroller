@@ -341,3 +341,70 @@ node --check   4 个改动模块语法通过
 
 
 
+
+---
+
+# 第五轮：双语字幕「变大的那一行」错了
+
+## 十三、现象
+
+用户反馈：双语歌词在预览里是**两行一起变色、原文放大**，
+导出的画面却变成**翻译行变大并且变色**，原文反而没有任何高亮。
+
+## 十四、根因：预览按「逻辑行」判当前行，导出按「单个下标」判
+
+同一时间的原文 + 翻译是**两个物理行**，两者 t 完全相同。
+
+- 预览（`StageView.vue`）用 `isActiveRow(i)` 判定：
+  它借 `fade.js` 的 `buildLogicalRows` 把同时间的行归并成"逻辑行"，
+  **整组一起**得到 `.is-active` → 两行同时变色、同时 `scale(1.35)`。
+  （原文看起来更大，只是因为它本身的字号是翻译行的 1/0.62 倍。）
+
+- 导出（`renderFrame.js`）当时写的是 `isActive = hasActive && i === cur`，
+  而 `cur` 来自 `findLineIndexAt()` —— 该函数返回"最后一个 `t <= time` 的下标"，
+  也就是**该组的最后一行**。
+
+于是组内顺序为「原文、翻译」时，被放大+变色的正是**翻译行**，原文掉回普通色、scale=1。
+实测抓取的 canvas 绘制参数：
+
+```
+修复前：我们的故事如何发展@1.00 #9aa4b2 | What a time, a time, a time@1.35 #ffffff
+修复后：我们的故事如何发展@1.35 #ffffff | What a time, a time, a time@1.35 #ffffff
+```
+
+两种组内顺序都错，只是错法不同：
+「原文在上」→ 翻译行变大变色（用户报的就是这个）；
+「翻译在上」→ 原文的放大对，但翻译行不跟着变色。
+
+## 十五、修法
+
+新增 `logicalRowRange(lines, index)`：返回与 `lines[index]` **时间完全相同**的下标闭区间。
+`renderFrame` 里当前行与"上一行（正在缩回的那组）"都改成按区间判定：
+
+```js
+const activeRange = hasActive ? logicalRowRange(lines, cur) : { start: -1, end: -1 }
+const prevRange   = trans.prev >= 0 ? logicalRowRange(lines, trans.prev) : { start: -1, end: -1 }
+const isActive   = inRange(i, activeRange)
+const isOutgoing = trans.scaleProg < 1 && inRange(i, prevRange)
+```
+
+顺带修好两处同源的偏差：换行过渡时**上一组的两行一起缩回**（原来只缩一行）；
+虚化关闭时翻译行的 CSS 附加透明度按 `.is-active` 分档（0.9 / 0.72），
+现在判定与预览一致。
+
+`findLineIndexAt` 与 `centeringOffsetFor` 不动 —— 预览的滚动目标同样取组内最后一行，
+两边仍然同源。
+
+## 十六、验证
+
+```
+core 测试      694 项全过（新增 5 项）
+真实浏览器     scripts/e2e-bilingual-parity.mjs 11 项全过
+```
+
+- 单元：`logicalRowRange` 的区间与非法下标；双语组两种顺序下"两行同色 + 两行都 scale 1.35"；
+  **组外的行不跟着高亮**（守住"只放大一组"，别修成整屏都亮）。
+- 浏览器（CDP + 无头 Edge）：拦截 `CanvasRenderingContext2D.fillText`，
+  直接读导出帧里每段文字当时的 `fillStyle` 与 `transform` 缩放，
+  与页面 DOM 上 `.is-active` 的行逐一比对 —— 这才是"导出=预览"的真正判据。
+  同一脚本在旧代码上跑会红 2 项，可作为长期回归。

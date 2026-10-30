@@ -143,6 +143,7 @@ import {
   anchorRatio,
   centeringOffsetFor,
   previousActiveIndex,
+  logicalRowRange,
   activeTransition,
   applyCssOpacityFactors,
   mixHex,
@@ -3319,6 +3320,93 @@ test('翻译行用更小的字号绘制（复刻 0.62em）', () => {
   const size = Number(tr.font.match(/(\d+(?:\.\d+)?)px/)[1])
   const base = 40 * (720 / 776)
   assert.ok(Math.abs(size - base * 0.62) < 1e-6, `翻译行字号 ${size}，应约 ${base * 0.62}`)
+})
+
+/*
+ * ── 双语组：导出必须整组高亮（与预览的 .is-active 同口径）──
+ *
+ * 回归来源：预览按「逻辑行」判断当前行（同时间的原文+翻译一起变色放大），
+ * 而导出曾用 `i === cur` 判单个下标。findLineIndexAt 返回的是该组最后一个下标，
+ * 于是组内顺序是「原文、翻译」时，被放大变色的变成了**翻译行**，原文反而不动 ——
+ * 用户看到的就是"导出时翻译行变大并且变色"。
+ */
+
+/** 按绘制顺序还原每段文字当时生效的缩放（save/scale/restore 成对出现） */
+function textsWithScale(probe) {
+  const out = []
+  const stack = []
+  let scale = 1
+  for (const o of probe.ops) {
+    if (o.op === 'save') stack.push(scale)
+    else if (o.op === 'restore') scale = stack.length ? stack.pop() : 1
+    else if (o.op === 'scale') scale *= o.x
+    else if (o.op === 'text') out.push({ text: o.text, scale, fillStyle: o.fillStyle, font: o.font })
+  }
+  return out
+}
+
+test('logicalRowRange：同时间的行归为同一逻辑行', () => {
+  const lines = [{ t: 0 }, { t: 0 }, { t: 5 }, { t: 5 }, { t: 5 }, { t: 9 }]
+  assert.deepEqual(logicalRowRange(lines, 0), { start: 0, end: 1 })
+  assert.deepEqual(logicalRowRange(lines, 1), { start: 0, end: 1 }, '组内任意一行都返回整组')
+  assert.deepEqual(logicalRowRange(lines, 3), { start: 2, end: 4 })
+  assert.deepEqual(logicalRowRange(lines, 5), { start: 5, end: 5 }, '单行成组')
+})
+
+test('logicalRowRange：下标非法时不匹配任何行', () => {
+  const lines = [{ t: 0 }, { t: 0 }]
+  assert.deepEqual(logicalRowRange(lines, -1), { start: -1, end: -1 })
+  assert.deepEqual(logicalRowRange(lines, 2), { start: -1, end: -1 })
+  assert.deepEqual(logicalRowRange([], 0), { start: -1, end: -1 })
+})
+
+test('双语组（原文在上、翻译在下）：原文与翻译都放大变色', () => {
+  const lines = [
+    { t: 0, text: '原文', empty: false },
+    { t: 0, text: 'translation', empty: false, isTranslation: true },
+    { t: 5, text: '下一句', empty: false },
+  ]
+  const probe = drawAt(scrollSettings, lines, 1.0)
+  const drawn = textsWithScale(probe)
+  const main = drawn.find((o) => o.text === '原文')
+  const tr = drawn.find((o) => o.text === 'translation')
+  assert.ok(main && tr, `两行都应被绘制，实际 ${JSON.stringify(drawn.map((o) => o.text))}`)
+  assert.ok(Math.abs(main.scale - 1.35) < 1e-6, `原文应放大到 1.35，实际 ${main.scale}`)
+  assert.ok(
+    Math.abs(tr.scale - 1.35) < 1e-6,
+    `翻译行也要放大（预览里 .is-active 打在整组上），实际 ${tr.scale}`,
+  )
+  assert.equal(tr.fillStyle, main.fillStyle, '同组两行必须同色（预览是两行一起变色）')
+})
+
+test('双语组（翻译在上、原文在下）：翻译行同样高亮，不因下标靠前而漏掉', () => {
+  const lines = [
+    { t: 0, text: 'translation', empty: false, isTranslation: true },
+    { t: 0, text: '原文', empty: false },
+    { t: 5, text: '下一句', empty: false },
+  ]
+  const probe = drawAt(scrollSettings, lines, 1.0)
+  const drawn = textsWithScale(probe)
+  const main = drawn.find((o) => o.text === '原文')
+  const tr = drawn.find((o) => o.text === 'translation')
+  assert.ok(Math.abs(main.scale - 1.35) < 1e-6, `原文应放大，实际 ${main.scale}`)
+  assert.ok(Math.abs(tr.scale - 1.35) < 1e-6, `翻译行应放大，实际 ${tr.scale}`)
+  assert.equal(tr.fillStyle, main.fillStyle, '同组两行必须同色')
+})
+
+test('双语组之外的行不跟着高亮（只有整组、不是全屏）', () => {
+  const lines = [
+    { t: 0, text: '上一句', empty: false },
+    { t: 5, text: '原文', empty: false },
+    { t: 5, text: 'translation', empty: false, isTranslation: true },
+    { t: 10, text: '下一句', empty: false },
+  ]
+  const probe = drawAt(scrollSettings, lines, 6.0)
+  const drawn = textsWithScale(probe)
+  const pick = (s) => drawn.find((o) => o.text === s)
+  assert.ok(Math.abs(pick('上一句').scale - 1) < 1e-6, '上一组的行不该被放大')
+  assert.ok(Math.abs(pick('下一句').scale - 1) < 1e-6, '下一句不该被放大')
+  assert.ok(Math.abs(pick('原文').scale - 1.35) < 1e-6, '当前组原文应放大')
 })
 
 test('还没到第一行时没有任何行放大（预览此时没有 .is-active）', () => {
