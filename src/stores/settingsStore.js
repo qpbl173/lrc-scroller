@@ -1,5 +1,5 @@
 import { defineStore } from 'pinia'
-import { createDefaultSettings, sanitizeSettings, toCssVars } from '@/core/settings'
+import { createDefaultSettings, migrateLegacyBackground, sanitizeSettings, toCssVars } from '@/core/settings'
 import { createSettingsStorage, createSettingsWriter } from '@/core/persist'
 import { CODES } from '@/core/errors'
 
@@ -20,8 +20,14 @@ export const useSettingsStore = defineStore('settings', {
     const loadIssue = read.ok ? '' : read.reason === 'empty' ? '' : read.reason
 
     return {
-      /** @type {import('@/core/settings').Settings} */
-      settings: read.ok ? sanitizeSettings(read.value) : createDefaultSettings(),
+      /**
+       * @type {import('@/core/settings').Settings}
+       *
+       * 【为什么要再过一次 migrateLegacyBackground】
+       * 默认值只对首次使用的人生效；老用户的 localStorage 里存的是旧默认
+       * （深空蓝 #0b0e14），不清洗就永远看不到"默认改成纯黑"这件事。
+       */
+      settings: read.ok ? migrateLegacyBackground(sanitizeSettings(read.value)) : createDefaultSettings(),
 
       /** 设置抽屉开关 */
       drawerOpen: false,

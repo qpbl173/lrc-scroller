@@ -22,6 +22,8 @@ import {
 import {
   createDefaultSettings,
   sanitizeSettings,
+  migrateLegacyBackground,
+  LEGACY_DEFAULT_BG,
   normalizeColor,
   toCssVars,
   pickEnum,
@@ -331,6 +333,50 @@ test("parseOffset('abc') → 0", () => assert.equal(parseOffset('abc'), 0))
 
 // ─────────────────────────────────────────────
 group('settings · 默认值与容错')
+
+group('settings · 默认背景必须是纯黑（导出视频的底色）')
+
+test('默认背景色 = #000000（纯黑，不是深空蓝）', () => {
+  const d = createDefaultSettings()
+  assert.equal(d.color.bg, '#000000')
+  assert.equal(d.color.bgMode, 'solid', '默认仍走"自定义色"，不要改成 black 模式（否则色轮会失效）')
+})
+
+test('默认设置的 --lrc-bg 就是纯黑（预览与导出同一个值）', () => {
+  assert.equal(toCssVars(createDefaultSettings())['--lrc-bg'], '#000000')
+})
+
+test('默认设置的导出底色也是纯黑（renderFrame 走 resolveBgColor）', () => {
+  assert.equal(resolveBgColor(createDefaultSettings().color), '#000000')
+})
+
+test('存量设置迁移：旧默认深空蓝 → 纯黑', () => {
+  const saved = sanitizeSettings({ color: { bg: LEGACY_DEFAULT_BG, bgMode: 'solid' } })
+  assert.equal(saved.color.bg, LEGACY_DEFAULT_BG, '清洗阶段不改色值')
+  const migrated = migrateLegacyBackground(saved)
+  assert.equal(migrated.color.bg, '#000000')
+  assert.equal(migrated.color.bgMode, 'solid')
+  assert.equal(saved.color.bg, LEGACY_DEFAULT_BG, '不能就地改原对象')
+})
+
+test('迁移只碰"仍是旧默认"的那一份：自定义色 / 绿幕 / 纯黑 都不动', () => {
+  const custom = sanitizeSettings({ color: { bg: '#123456', bgMode: 'solid' } })
+  assert.equal(migrateLegacyBackground(custom), custom, '自定义色原样返回（同一个对象）')
+
+  const green = sanitizeSettings({ color: { bg: LEGACY_DEFAULT_BG, bgMode: 'green' } })
+  assert.equal(migrateLegacyBackground(green).color.bg, LEGACY_DEFAULT_BG, '绿幕模式的自定义色不生效，不该改')
+
+  const black = sanitizeSettings({ color: { bg: LEGACY_DEFAULT_BG, bgMode: 'black' } })
+  assert.equal(migrateLegacyBackground(black).color.bg, LEGACY_DEFAULT_BG, '纯黑模式同样不碰')
+})
+
+test('迁移可重复执行（幂等），脏输入不崩', () => {
+  const once = migrateLegacyBackground(sanitizeSettings({ color: { bg: LEGACY_DEFAULT_BG } }))
+  assert.equal(migrateLegacyBackground(once).color.bg, '#000000')
+  assert.equal(migrateLegacyBackground(null), null)
+  assert.equal(migrateLegacyBackground(undefined), undefined)
+  assert.doesNotThrow(() => migrateLegacyBackground(/** @type {any} */ ({})))
+})
 
 test('默认设置结构完整', () => {
   const d = createDefaultSettings()

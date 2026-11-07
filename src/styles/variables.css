@@ -14,7 +14,9 @@
   --lrc-active-scale: 1.35;
   --lrc-color-normal: #9aa4b2;
   --lrc-color-active: #ffffff;
-  --lrc-bg: #0b0e14;
+  /* 兜底值必须与 core/settings.js 的默认背景一致（纯黑）：
+     否则首屏到"设置注入"之间会闪一下偏蓝的黑，看起来像背景色没生效 */
+  --lrc-bg: #000000;
   --lrc-align: center;
   --lrc-pad-top: 35%;
   --lrc-pad-bottom: 35%;

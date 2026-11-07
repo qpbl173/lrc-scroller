@@ -55,7 +55,16 @@ export function createDefaultSettings() {
        * 白色又会与 active 混淆，所以默认沿用 accent 蓝，允许单独改色。
        */
       charProgress: '#4c8dff',
-      bg: '#0b0e14',
+      /**
+       * 背景色默认**纯黑**。
+       *
+       * 【为什么是 #000000，而不是"深空蓝 #0b0e14"】
+       * 这个色不只是预览底色，它就是导出视频的底色。深蓝黑在播放器/视频平台上
+       * 与"纯黑"并排时一眼能看出偏色（周围是 #000，我们的画面是偏蓝的灰），
+       * 而且任何非零的底色在压暗字幕、二次压缩之后都会显出脏边。
+       * 想要氛围色的人可以在设置里点色轮改，默认值应当是"不存在感"的纯黑。
+       */
+      bg: '#000000',
       bgMode: 'solid', // solid | green | black
     },
 
@@ -496,6 +505,36 @@ export function sanitizeSettings(raw) {
 /** 只接受白名单里的字符串，否则回默认。 */
 export function pickEnum(value, allowed, fallback) {
   return allowed.includes(value) ? value : fallback
+}
+
+/**
+ * 旧版默认背景色（深空蓝黑）。只用于识别"用户从没改过背景"的存量设置。
+ */
+export const LEGACY_DEFAULT_BG = '#0b0e14'
+
+/**
+ * 把"仍是旧版默认背景色"的存量设置迁移到纯黑。
+ *
+ * 【为什么需要这一步，而不是改个默认值就完事】
+ * 默认值只影响**第一次使用**的人。老用户 localStorage 里已经存着
+ * `color.bg: '#0b0e14'`（旧默认），只改 createDefaultSettings 对他们完全无效 ——
+ * 界面上还是那片偏蓝的黑，看起来像"改了没生效"。
+ *
+ * 【为什么敢按色值判定"没改过"】
+ * #0b0e14 是旧默认值本身，恰好手动选到同一个色值几乎不可能；
+ * 且只在 bgMode === 'solid'（自定义色生效的模式）下迁移，
+ * 绿幕/纯黑模式下这个字段本来就无效，不该动它。
+ *
+ * 用户之后想换回深蓝，在设置里点色轮就行 —— 迁移只发生一次（存回去就是新值）。
+ *
+ * @param {Settings} s
+ * @returns {Settings} 需要迁移时返回新对象，否则原样返回
+ */
+export function migrateLegacyBackground(s) {
+  if (!s || typeof s !== 'object' || !s.color) return s
+  if (s.color.bgMode !== 'solid') return s
+  if (String(s.color.bg).toLowerCase() !== LEGACY_DEFAULT_BG) return s
+  return { ...s, color: { ...s.color, bg: /** @type {string} */ (createDefaultSettings().color.bg) } }
 }
 
 /**
