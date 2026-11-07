@@ -77,6 +77,88 @@ export const EMPTY_LABEL = '（间奏）'
 export const EDGE_INSET = 0
 
 /** 虚化关闭时，预览由 CSS 类附加的子元素透明度系数 */
+/**
+ * 字间距支持性探测（带缓存）。
+ *
+ * 【为什么必须探测】
+ * `ctx.letterSpacing` 是较新的 canvas 属性：桌面 Chromium 支持，
+ * 但**微信小程序真机（iOS/Android）普遍不支持** —— 赋值不报错、只是绘制时被忽略。
+ * 实测（真机 iPhone，基础库 3.17.6）：设了 letterSpacing 后 measureText 宽度不变。
+ * 所以不能只看"属性有没有被保存"，必须**改前改后测同一个字符串的宽度**。
+ *
+ * @param {CanvasRenderingContext2D} ctx
+ * @returns {boolean}
+ */
+const lsSupportCache = new WeakMap()
+
+export function detectLetterSpacingSupport(ctx) {
+  if (!ctx || typeof ctx.measureText !== 'function') return false
+  if (lsSupportCache.has(ctx)) return lsSupportCache.get(ctx)
+
+  let ok = false
+  let savedFont = ''
+  try {
+    // 探测会临时改 font 与 letterSpacing，必须原样还回去，否则污染后续测量
+    savedFont = ctx.font
+    const before = ctx.letterSpacing
+    ctx.font = '40px sans-serif'
+    const w0 = ctx.measureText('AVAV').width
+    ctx.letterSpacing = '20px'
+    const w1 = ctx.measureText('AVAV').width
+    ctx.letterSpacing = before || '0px'
+    // 4 个字符 × 20px 应带来 60px 的增量（CSS/Canvas 都在每个字后加间距，末字除外）
+    ok = Number.isFinite(w0) && Number.isFinite(w1) && Math.abs(w1 - w0) > 20
+  } catch (e) {
+    ok = false
+  }
+  try {
+    // 即使是空串也要还原（某些实现把 font 设为 '' 表示默认字体）
+    ctx.font = savedFont
+  } catch (e) {
+    /* 恢复失败不影响主流程 */
+  }
+  lsSupportCache.set(ctx, ok)
+  return ok
+}
+
+/**
+ * 调试开关：强制走"逐字绘制"。
+ *
+ * 真机上本来就会自动走逐字（探测结果为不支持）；这个开关的意义是
+ * 让模拟器（支持 letterSpacing）也能复现真机路径，便于像素比对。
+ */
+export let forceManualLetterSpacing = false
+
+/** @param {boolean} v */
+export function setForceManualLetterSpacing(v) {
+  forceManualLetterSpacing = !!v
+}
+
+/**
+ * 把一个"不含字间距"的测量值换算成"含字间距"的宽度。
+ *
+ * 【为什么单独暴露】
+ * 绘制侧（renderFrame）与排版侧（measureRowLayout 的 measure 回调、
+ * 小程序页面自己传进来的 measure）必须用同一套宽度公式，否则
+ * "按窄宽度换行、按宽宽度绘制"会溢出。真机不支持 letterSpacing 时
+ * 这个补偿必须由我们自己加。
+ *
+ * @param {number} baseWidth ctx.measureText 的量测值
+ * @param {number} charCount 字符数
+ * @param {number} size 字号（px）
+ * @param {number} em 字间距（em）
+ * @returns {number}
+ */
+export function letterSpacingWidth(baseWidth, charCount, size, em) {
+  const ls = Number(em)
+  const base = Number(baseWidth)
+  if (!Number.isFinite(base)) return 0
+  if (!Number.isFinite(ls) || ls === 0) return base
+  const n = Number(charCount)
+  if (!Number.isFinite(n) || n <= 1) return base
+  return base + (n - 1) * Number(size) * ls
+}
+
 export const CSS_OPACITY = {
   empty: 0.35,
   translation: 0.72,
@@ -647,10 +729,14 @@ export function renderFrame({
   function measureWidth(s) {
     const base = ctx.measureText(s).width
     if (!Number.isFinite(lsCfg) || lsCfg === 0) return base
+    /*
+     * 支持 letterSpacing 的实现里，measureText **已经**把间距算进去了；
+     * 再补一次就是重复计算（会提前换行）。只有不支持时（真机）才由我们补。
+     */
+    if (detectLetterSpacingSupport(ctx)) return base
     const m = ctxFont.match(/(\d+(?:\.\d+)?)px/)
     const size = m ? Number(m[1]) : baseFontSize
-    const n = [...s].length
-    return base + Math.max(0, n - 1) * size * lsCfg
+    return letterSpacingWidth(base, [...s].length, size, lsCfg)
   }
 
   const measure = (s, size) => {
@@ -770,6 +856,106 @@ const charProgressColor = settings?.color?.charProgress ?? '#4c8dff'
     const parts = row.textLines
     const total = parts.length
 
+    /*
+     * ── 放大不能把字放大到画布外 ──
+     *
+     * 【问题】
+     * 换行宽度按版心（maxWidth）算，而"当前行放大"是在换行之后才乘上去的。
+     * 于是一行只要宽度落在 (版心/scale, 版心] 区间，平时正好放得下，
+     * 一变成当前行就会被放大到版心之外 —— 左右两端直接被裁掉。
+     *
+     * 手机上这个区间特别宽：竖屏舞台只有 366px，英文翻译行 900px 宽、
+     * 放大 1.35 后 1215px，实测左右各被裁掉 58px（截图可复现）。
+     * 网页端竖版（9:16）同理，只是桌面横屏时不容易撞上。
+     *
+     * 【做法：按版心等比收窄，不裁字也不改换行】
+     * 算出这一行最宽的那行文字，若 宽 × scale 超过可用宽度，
+     * 就把 scale 压到"刚好放得下"。只压不放（Math.min），且不压到 1 以下 ——
+     * 那属于换行没做好，应由 measureRowLayout 负责，不该靠缩字掩盖。
+     */
+    let drawScale = scale
+    if (Number.isFinite(drawScale) && drawScale > 1) {
+      let widest = 0
+      for (let j = 0; j < total; j++) {
+        const w = measureWidth(parts[j])
+        if (w > widest) widest = w
+      }
+      /*
+       * 收窄到**版心**而不是画布宽：
+       * 版心（layout.maxWidth，默认 0.9）本来就是这个应用定义的"文字可用区"，
+       * 按画布宽收会得到一条贴边、零留白的行 —— 像素导出一看就知道难看。
+       */
+      const mwRatio = Number(settings?.layout?.maxWidth)
+      const ratio = Number.isFinite(mwRatio) && mwRatio > 0 ? mwRatio : 0.9
+      const avail = Math.min(layoutWidth * ratio || W, W)
+      if (widest > 0 && widest * drawScale > avail) {
+        drawScale = Math.max(1, avail / widest)
+      }
+    }
+    // 下面的绘制统一用收窄后的比例（语义仍是"当前行放大"，只是不越界）
+    scale = drawScale
+
+    /*
+     * ── 字间距：真机不支持 ctx.letterSpacing 时逐字绘制 ──
+     *
+     * 真机（iOS/Android 微信 3.17.6 实测）把 letterSpacing 当普通属性存下来，
+     * 但绘制与 measureText 都当它不存在。后果是"字间距"这条设置完全失效。
+     *
+     * 对策：自己按 "字宽 + 间距" 逐个推进绘制。三条约束：
+     *   1. 宽度必须与 measureWidth 同一公式（letterSpacingWidth），否则会溢出；
+     *   2. 逐字描边在字与字重叠时会露出接缝 —— 但我们已经加了间距，字形本身不重叠；
+     *   3. 对齐方式不能再用 ctx.textAlign（逐字时它是按整串算的），
+     *      必须自己算起始 x：居中=锚点-宽/2，右对齐=锚点-宽。
+     */
+    const lsPx = Number.isFinite(lsCfg) && lsCfg !== 0 ? size * lsCfg : 0
+    const manualSpacing = lsPx !== 0 && (forceManualLetterSpacing || !detectLetterSpacingSupport(ctx))
+    if (manualSpacing) ctx.letterSpacing = '0px'
+
+    /** 一行文字的逐字宽度（不含字间距） */
+    function charWidthsOf(text) {
+      const out = []
+      for (const ch of text) out.push(ctx.measureText(ch).width)
+      return out
+    }
+
+    /** 含手动字间距的整行宽度；与 measureWidth 的算法保持一致 */
+    function spacingWidthOf(widths) {
+      let sum = 0
+      for (let k = 0; k < widths.length; k++) sum += widths[k]
+      return sum + lsPx * Math.max(0, widths.length - 1)
+    }
+
+    /** 按对齐方式求绘制起点；base 是锚点（居中=中心，右对齐=右缘，左对齐=左缘） */
+    function startXFor(w, base) {
+      if (isRight) return base - w
+      if (isLeft) return base
+      return base - w / 2
+    }
+
+    /**
+     * 画一行（含逐字兜底）。
+     * @param {string} text
+     * @param {number} y
+     * @param {number} base 锚点 x
+     */
+    function drawLine(text, y, base) {
+      if (!manualSpacing) {
+        paint(text, base, y)
+        return
+      }
+      const widths = charWidthsOf(text)
+      const w = spacingWidthOf(widths)
+      const prevAlign = ctx.textAlign
+      ctx.textAlign = 'left'
+      let x = startXFor(w, base)
+      let i = 0
+      for (const ch of text) {
+        paint(ch, x, y)
+        x += widths[i++] + lsPx
+      }
+      ctx.textAlign = prevAlign
+    }
+
     /**
      * 画一个字形：顺序由「描边位置」决定。
      *
@@ -817,13 +1003,14 @@ const charProgressColor = settings?.color?.charProgress ?? '#4c8dff'
       ctx.scale(scale, scale)
       for (let j = 0; j < total; j++) {
         const y = (j - (total - 1) / 2) * size * lineHeight
-        paint(parts[j], 0, y)
+        // 锚点在局部坐标里是 0（上面的 translate 已经把原点挪到锚点）
+        drawLine(parts[j], y, 0)
       }
       ctx.restore()
     } else {
       for (let j = 0; j < total; j++) {
         const y = cy + (j - (total - 1) / 2) * size * lineHeight
-        paint(parts[j], anchorX, y)
+        drawLine(parts[j], y, anchorX)
       }
     }
 
@@ -855,16 +1042,30 @@ const charProgressColor = settings?.color?.charProgress ?? '#4c8dff'
       const clipHeight = size * lineHeight * (total + 1.4)
 
       // 逐行裁剪：每一行文字各自从它的起点量宽度，多行时进度按行分别应用
+      const scaledRow = Number.isFinite(scale) && scale !== 1
+
       for (let j = 0; j < total; j++) {
-        const y = Number.isFinite(scale) && scale !== 1
+        const y = scaledRow
           ? (j - (total - 1) / 2) * size * lineHeight
           : cy + (j - (total - 1) / 2) * size * lineHeight
 
-        const w = measureWidth(parts[j])
+        // 宽度必须与实际绘制一致：逐字模式下是"逐字宽 + 间距"之和
+        const widths = manualSpacing ? charWidthsOf(parts[j]) : null
+        const w = widths ? spacingWidthOf(widths) : measureWidth(parts[j])
         if (!(w > 0)) continue
 
+        /*
+         * 裁剪矩形从**行的左缘**开始，不是从 anchorX 开始。
+         * 居中/右对齐时 anchorX 是中心/右缘，早先直接用 anchorX 会让
+         * 居中行的进度色只覆盖右半边（左半边永远不变色）。
+         * 放大时左缘与宽度都要乘 scale —— 裁剪在 translate 之前生效。
+         */
+        const base = scaledRow ? 0 : anchorX
+        const left = scaledRow ? anchorX + startXFor(w, 0) * scale : startXFor(w, anchorX)
+        const clipW = w * p * (scaledRow ? scale : 1)
+
         ctx.beginPath()
-        ctx.rect(anchorX, clipTop, w * p, clipHeight)
+        ctx.rect(left, clipTop, clipW, clipHeight)
         ctx.clip()
 
         /*
@@ -875,30 +1076,14 @@ const charProgressColor = settings?.color?.charProgress ?? '#4c8dff'
         ctx.fillStyle = charProgressColor
         if (strokeOn) ctx.strokeStyle = strokeColor
 
-        if (Number.isFinite(scale) && scale !== 1) {
+        if (scaledRow) {
           ctx.translate(anchorX, cy)
           ctx.scale(scale, scale)
-          if (strokeOn && strokeCenter) {
-            ctx.fillText(parts[j], 0, y)
-            ctx.strokeText(parts[j], 0, y)
-          } else if (strokeOn) {
-            ctx.strokeText(parts[j], 0, y)
-            ctx.fillText(parts[j], 0, y)
-          } else {
-            ctx.fillText(parts[j], 0, y)
-          }
+          drawLine(parts[j], y, 0)
           ctx.translate(-anchorX, -cy)
           ctx.scale(1 / scale, 1 / scale)
         } else {
-          if (strokeOn && strokeCenter) {
-            ctx.fillText(parts[j], anchorX, y)
-            ctx.strokeText(parts[j], anchorX, y)
-          } else if (strokeOn) {
-            ctx.strokeText(parts[j], anchorX, y)
-            ctx.fillText(parts[j], anchorX, y)
-          } else {
-            ctx.fillText(parts[j], anchorX, y)
-          }
+          drawLine(parts[j], y, anchorX)
         }
       }
 

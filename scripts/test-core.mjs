@@ -144,6 +144,9 @@ import {
   centeringOffsetFor,
   previousActiveIndex,
   logicalRowRange,
+  detectLetterSpacingSupport,
+  setForceManualLetterSpacing,
+  letterSpacingWidth,
   activeTransition,
   applyCssOpacityFactors,
   mixHex,
@@ -3199,6 +3202,89 @@ test('rgbaOf：非法透明度按 1 处理，不产出 NaN', () => {
 })
 
 // ─────────────────────────────────────────────
+group('renderFrame · 逐字进度裁剪（居中时不能只染右半边）')
+
+/*
+ * 回归来源：用户「逐字打轴 + 视频导出」反馈 ——
+ * 布局为居中时，导出的每一行都只有**右半边**是进度色，左边仍是当前行色；
+ * 左对齐则正常。原因是裁剪矩形以 anchorX 起算：居中的 anchorX 是行中心，
+ * 于是裁剪窗口 = [中心, 中心+宽×进度]，正好落在右半边。
+ * 预览用的是 background-clip:text + 渐变，从行首开始，所以预览正常。
+ *
+ * 这三条用例把「左缘起算」锁死：居中 / 左 / 右三种对齐各测一次。
+ */
+
+/** 造一行带逐字时间的歌词（每个字间隔 step 秒） */
+function makeCharLine(text, t0, step = 1) {
+  const chars = [...text].map((c, i) => ({ c, t: t0 + i * step }))
+  return { t: t0, text, chars, empty: false }
+}
+
+/** 取所有裁剪矩形（背景用 fillRect，rect 只可能来自进度裁剪） */
+function clipRects(probe) {
+  return probe.ops.filter((o) => o.op === 'rect')
+}
+
+test('居中：已唱完的行（p=1）裁剪覆盖整行，矩形中心落在锚点上', () => {
+  const lines = [makeCharLine('abcd', 0), { t: 10, text: '下一句', empty: false }]
+  const probe = drawAt(scrollSettings, lines, 12)
+  const rects = clipRects(probe)
+  assert.equal(rects.length, 1, `只有带逐字时间的行才裁剪，实际 ${rects.length} 个矩形`)
+
+  const r = rects[0]
+  const size = 40 * (720 / 776)
+  // 宽度含字间距：支持 letterSpacing 的实现里 measureText 已经算进去了
+  const w = 4 * size + 3 * size * scrollSettings.font.letterSpacing
+  const center = r.x + r.w / 2
+  assert.ok(
+    Math.abs(center - 640) < 1.5,
+    `居中行的裁剪中心应≈画布中心 640，实际 ${center.toFixed(1)}（右移说明又从 anchorX 起算了）`,
+  )
+  assert.ok(Math.abs(r.w - w) < 1, `p=1 应覆盖整行 ${w.toFixed(1)}px，实际 ${r.w.toFixed(1)}px`)
+})
+
+test('居中 + 当前行放大：裁剪从行左缘起，宽度 = 行宽 × 进度 × 缩放', () => {
+  const probe = drawAt(scrollSettings, [makeCharLine('abcd', 0, 1)], 1.5) // p = 0.375
+  const rects = clipRects(probe)
+  assert.equal(rects.length, 1, `应有一次裁剪，实际 ${rects.length}`)
+
+  const r = rects[0]
+  const size = 40 * (720 / 776)
+  const w = 4 * size + 3 * size * scrollSettings.font.letterSpacing
+  const scale = 1.35
+  const p = 0.375
+  const expectX = 640 - (w / 2) * scale
+  const expectW = w * p * scale
+
+  assert.ok(
+    Math.abs(r.x - expectX) < 1.5,
+    `裁剪左缘应为 ${expectX.toFixed(1)}，实际 ${r.x.toFixed(1)}`,
+  )
+  assert.ok(
+    Math.abs(r.w - expectW) < 1.5,
+    `裁剪宽度应为 ${expectW.toFixed(1)}，实际 ${r.w.toFixed(1)}`,
+  )
+})
+
+test('左对齐 / 右对齐：裁剪同样按"行左缘 → 行宽 × 进度"计算', () => {
+  const left = { ...scrollSettings, layout: { ...scrollSettings.layout, align: 'left' } }
+  const right = { ...scrollSettings, layout: { ...scrollSettings.layout, align: 'right' } }
+  const size = 40 * (720 / 776)
+  const w = 4 * size + 3 * size * scrollSettings.font.letterSpacing
+
+  const probeL = drawAt(left, [makeCharLine('abcd', 0), { t: 10, text: 'x', empty: false }], 12)
+  const rL = clipRects(probeL)[0]
+  assert.ok(Math.abs(rL.x) < 1.5, `左对齐应从版心左缘 0 起，实际 ${rL.x.toFixed(1)}`)
+
+  const probeR = drawAt(right, [makeCharLine('abcd', 0), { t: 10, text: 'x', empty: false }], 12)
+  const rR = clipRects(probeR)[0]
+  assert.ok(
+    Math.abs(rR.x - (1280 - w)) < 1.5,
+    `右对齐应从 ${(1280 - w).toFixed(1)} 起，实际 ${rR.x.toFixed(1)}`,
+  )
+  assert.ok(Math.abs(rR.w - w) < 1, `p=1 应覆盖整行，实际 ${rR.w.toFixed(1)}`)
+})
+
 group('renderFrame · 画布绘制结果（插桩验证导出到底画了什么）')
 
 /** 记录所有绘制调用的假 canvas */
@@ -3254,8 +3340,10 @@ function makeProbeCanvas(w, h) {
     measureText(s) {
       const m = font.match(/(\d+(?:\.\d+)?)px/)
       const size = m ? Number(m[1]) : 40
-      // 近似 CJK 全宽：一个字约等于字号
-      return { width: [...s].length * size }
+      // 与真实桌面 Canvas 一致：measureText 会把 letterSpacing 算进去
+      const ls = parseFloat(String(this.letterSpacing || '0px')) || 0
+      const n = [...s].length
+      return { width: n * size + Math.max(0, n - 1) * ls }
     },
     fillText(text, x, y) {
       ops.push({ op: 'text', text, x, y, font, fillStyle: String(this.fillStyle) })
@@ -3428,6 +3516,85 @@ test('到了第一行之后当前行被放大（含首行）', () => {
   const scales = probe.ops.filter((o) => o.op === 'scale')
   assert.ok(scales.length > 0, '当前行应被放大')
   assert.ok(Math.abs(scales[0].x - 1.35) < 1e-6, `缩放应为 1.35，实际 ${scales[0].x}`)
+})
+
+test('detectLetterSpacingSupport：能分辨"支持"与"真机不支持"，且不污染 font', () => {
+  const mk = (honor) => ({
+    font: '600 40px sans-serif',
+    letterSpacing: '0px',
+    measureText(s) {
+      const ls = honor ? parseFloat(String(this.letterSpacing || '0px')) || 0 : 0
+      const n = [...s].length
+      return { width: n * 40 + Math.max(0, n - 1) * ls }
+    },
+  })
+
+  const browser = mk(true)
+  assert.equal(detectLetterSpacingSupport(browser), true, '认 letterSpacing 的实现应判为支持')
+  assert.equal(browser.font, '600 40px sans-serif', '探测后必须还原 font')
+
+  const device = mk(false)
+  assert.equal(detectLetterSpacingSupport(device), false, '真机（赋值无效）应判为不支持')
+  assert.equal(device.font, '600 40px sans-serif', '不支持时也要还原 font')
+  assert.equal(device.letterSpacing, '0px', '探测后必须还原 letterSpacing')
+})
+
+test('letterSpacingWidth：n 个字加 n-1 个间距，0 与单字不加', () => {
+  assert.equal(letterSpacingWidth(100, 2, 10, 0), 100)
+  assert.equal(letterSpacingWidth(100, 1, 10, 0.5), 100, '单字没有"字与字之间"的间距')
+  assert.equal(letterSpacingWidth(100, 4, 10, 0.5), 115, '4 个字 → 3 个 5px 间距')
+})
+
+test('强制逐字模式：按"字宽 + 间距"逐字推进（真机路径）', () => {
+  /*
+   * 真机（iOS/Android 微信 3.17.6 实测）不支持 ctx.letterSpacing，
+   * 字间距设置会完全失效。这条用例锁住兜底实现：
+   *   1. 整串不再一次性 fillText，而是一个字一个 fillText；
+   *   2. 相邻两字的 x 差 = 该字宽 + 间距（否则字会挤在一起或散开）。
+   */
+  setForceManualLetterSpacing(true)
+  try {
+    const lines = [{ t: 0, text: 'AB', empty: false }]
+    const probe = drawAt(scrollSettings, lines, 0.5)
+    const texts = probe.texts().map((o) => o.text)
+    assert.ok(!texts.includes('AB'), '不应整串绘制，实际：' + JSON.stringify(texts))
+    assert.ok(texts.includes('A') && texts.includes('B'), '应逐字绘制，实际：' + JSON.stringify(texts))
+
+    const a = probe.texts().find((o) => o.text === 'A')
+    const b = probe.texts().find((o) => o.text === 'B')
+    const size = 40 * (720 / 776) // renderFrame 内部 drawSize
+    const lsPx = size * 0.02 // scrollSettings.font.letterSpacing
+    assert.ok(
+      Math.abs(b.x - a.x - (size + lsPx)) < 1e-6,
+      `推进距离应为 字宽${size.toFixed(2)}+间距${lsPx.toFixed(2)}，实际 ${(b.x - a.x).toFixed(2)}`,
+    )
+  } finally {
+    setForceManualLetterSpacing(false)
+  }
+})
+
+test('长句变当前行时按版心收窄，不把字放大到画布外（手机竖屏实测会裁字）', () => {
+  /*
+   * 回归来源：换行宽度按版心算，放大却在换行之后才乘上去。
+   * 一行只要落在 (版心/1.35, 版心] 区间，平时放得下，一变成当前行就溢出被裁。
+   * 手机竖屏舞台只有 366px 时实测：英文翻译行 900px，放大后 1215px，左右各裁 58px。
+   */
+  const longText = '一'.repeat(27) // 探针里 measureText 按 1em/字：27 字 ≈ 27 × 37.1 ≈ 1002px
+  const lines = [{ t: 0, text: longText, empty: false }]
+  const probe = drawAt(scrollSettings, lines, 0.5, 1280, 720)
+  const scales = probe.ops.filter((o) => o.op === 'scale')
+  assert.ok(scales.length > 0, '当前行仍应放大')
+  assert.ok(scales[0].x < 1.35 - 1e-6, `超出画布时必须收窄，实际仍为 ${scales[0].x}`)
+  assert.ok(scales[0].x > 1, `收窄也不该压到 1 以下（那是换行的责任），实际 ${scales[0].x}`)
+  // 收窄后必须真的放得下
+  assert.ok(1002 * scales[0].x <= 1280 + 1, `收窄后仍溢出：${(1002 * scales[0].x).toFixed(0)}px > 1280px`)
+})
+
+test('短句不受收窄影响，照常放大到 1.35', () => {
+  const lines = [{ t: 0, text: '短句', empty: false }]
+  const probe = drawAt(scrollSettings, lines, 0.5, 1280, 720)
+  const scales = probe.ops.filter((o) => o.op === 'scale')
+  assert.ok(Math.abs(scales[0].x - 1.35) < 1e-6, `短句不该被收窄，实际 ${scales[0].x}`)
 })
 
 test('换行途中当前行处于部分放大（不是瞬间到 1.35）', () => {
