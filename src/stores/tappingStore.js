@@ -16,6 +16,7 @@ import {
   tapSlotIndexes,
   serializeCharState,
   splitChars,
+  tapUnitModeOf,
 } from '@/core/charProgress'
 
 /**
@@ -233,16 +234,47 @@ export const useTappingStore = defineStore('tapping', {
 
     // ── 逐字（增强 LRC）────────────────────────
 
-    /** 当前逐字行的完整字表（未拆过则空数组） */
+    /**
+     * 当前逐字行的完整单元表（未拆过则只读地算一份，不写状态）。
+     *
+     * 【为什么要兜底计算】
+     * 草稿是按需建的（只建当前看得见的一行）。打完一行自动跳到下一行时，
+     * 那一行还没有草稿 → 界面立刻显示「该行无字可打」，
+     * 而实际上它明明有 4 个词。用户会以为打轴坏了。
+     * 这里只做只读兜底（splitChars 是确定性函数），不写 charDraft ——
+     * 写状态会让"草稿是否为空"这类判断（charHasDraft / 存盘）失真。
+     */
     charChars(state) {
       const chars = state.charDraft[state.charLineIndex]
-      return Array.isArray(chars) ? chars : []
+      if (Array.isArray(chars)) return chars
+      const line = this.tapTarget[state.charLineIndex]
+      if (!line || typeof line.text !== 'string') return []
+      return splitChars(line.text)
     },
 
     /** 当前逐字行已打轴的字数 */
     charTimedCount(state) {
       const chars = state.charDraft[state.charLineIndex]
       return countTimedChars(chars)
+    },
+
+    /**
+     * 当前行按「字」还是按「词」打轴。
+     *
+     * 【为什么界面上要区分】
+     * 纯英文行按词打（一次空格吃一个整词），中文行按字打。
+     * 进度标记若一律写「3/12 字」，英文行会显示成"12 字"——
+     * 用户会以为自己漏打了字母，而不是"还剩 12 个词"。
+     * 粒度的判定只在 core 里有一份实现，store 只是把它暴露给界面。
+     */
+    charUnitMode(state) {
+      const line = this.tapTarget[state.charLineIndex]
+      return tapUnitModeOf(line ? line.text : '')
+    },
+
+    /** 界面文案里的单元名：英文行「词」，其余「字」 */
+    charUnitName() {
+      return this.charUnitMode === 'word' ? '词' : '字'
     },
 
     /**

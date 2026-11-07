@@ -193,6 +193,10 @@ import {
   tapSlotIndexes,
   isCharTimed,
   splitChars,
+  splitWords,
+  splitLetters,
+  tapUnitModeOf,
+  unitWeights,
   isTappableChar,
   charTapRefusal,
   createCharTapState,
@@ -5921,6 +5925,77 @@ test('模式白名单：未知值退回 smooth（脏输入不得产生 NaN）', 
 test('CHAR_PROGRESS_MODES 只含已实现的两种', () => {
   assert.deepEqual([...CHAR_PROGRESS_MODES], ['smooth', 'step'])
 })
+
+group('charProgress · 词级权重（英文扫色按词宽分配，不能一个词一份）')
+
+test('unitWeights：码点数即份额，尾随空格也计入（它确实占宽度）', () => {
+  assert.deepEqual(unitWeights([{ c: 'I ' }, { c: 'love ' }, { c: 'you' }]), [2, 5, 3])
+  assert.deepEqual(unitWeights([{ c: '你' }, { c: '好，' }]), [1, 2])
+})
+
+test('unitWeights：空串/脏数据退回 1（不许出现 0 权重的单元）', () => {
+  assert.deepEqual(unitWeights([{ c: '' }, {}, { c: 'ok' }]), [1, 1, 2])
+  assert.deepEqual(unitWeights(null), [])
+})
+
+test('charProgressAt：传权重时按份额推进（I / love / you = 2/5/3）', () => {
+  const chars = [{ c: 'I ', t: 1 }, { c: 'love ', t: 2 }, { c: 'you', t: 3 }]
+  const w = unitWeights(chars) // [2, 5, 3]，总计 10
+  assert.equal(charProgressAt(chars, 1, 'smooth', w), 0, '首词时间点还没到')
+  assert.equal(charProgressAt(chars, 2, 'smooth', w), 0.2, 'I 唱完 = 2/10')
+  assert.equal(charProgressAt(chars, 2.5, 'smooth', w), 0.45, 'love 唱一半 = (2 + 2.5)/10')
+  assert.equal(charProgressAt(chars, 3, 'smooth', w), 1, '末词唱完整行全亮')
+})
+
+test('charProgressAt：step 模式同样按份额整词跳变', () => {
+  const chars = [{ c: 'I ', t: 1 }, { c: 'love ', t: 2 }, { c: 'you', t: 3 }]
+  const w = unitWeights(chars)
+  assert.equal(charProgressAt(chars, 2, 'step', w), 0.2)
+  assert.equal(charProgressAt(chars, 2.99, 'step', w), 0.2)
+})
+
+test('charProgressAt：不传权重 / 长度不符 → 退回等权（口径不被脏数据改变）', () => {
+  const chars = [{ c: 'I ', t: 1 }, { c: 'love ', t: 2 }, { c: 'you', t: 3 }]
+  const equal = charProgressAt(chars, 2.5)
+  assert.equal(equal, 0.5)
+  assert.equal(charProgressAt(chars, 2.5, 'smooth', null), equal)
+  assert.equal(charProgressAt(chars, 2.5, 'smooth', [2, 5]), equal, '长度不符必须忽略')
+  assert.equal(charProgressAt(chars, 2.5, 'smooth', [0, -1, NaN]), equal, '全脏权重仍应等权')
+})
+
+test('charProgressForLine：英文行自动用词权重，中文行保持等权', () => {
+  const en = {
+    t: 0,
+    text: 'I love you',
+    chars: [{ c: 'I ', t: 0 }, { c: 'love ', t: 1 }, { c: 'you', t: 2 }],
+  }
+  // 权重 2/5/3：t=1.5 → (2 + 2.5)/10 = 0.45（等权会得到 0.5）
+  assert.equal(charProgressForLine([en], 0, 1.5), 0.45)
+
+  const zh = {
+    t: 0,
+    text: '你好世界',
+    chars: [{ c: '你', t: 0 }, { c: '好', t: 1 }, { c: '世', t: 2 }, { c: '界', t: 3 }],
+  }
+  assert.equal(charProgressForLine([zh], 0, 1.5), 0.375, '中文仍是等权 1/n')
+})
+
+test('charProgressForLine：翻译行跟随主行时，权重也跟随主行', () => {
+  const lines = [
+    {
+      t: 0,
+      text: 'I love you',
+      chars: [{ c: 'I ', t: 0 }, { c: 'love ', t: 1 }, { c: 'you', t: 2 }],
+    },
+    { t: 0, text: '我爱你', isTranslation: true, chars: null },
+  ]
+  assert.equal(charProgressForLine(lines, 1, 1.5), charProgressForLine(lines, 0, 1.5))
+})
+
+test('charProgressForLine：没有行正文时按字表拼回来判定（老数据也走对分支）', () => {
+  const line = { t: 0, chars: [{ c: 'I ', t: 0 }, { c: 'love ', t: 1 }, { c: 'you', t: 2 }] }
+  assert.equal(charProgressForLine([line], 0, 1.5), 0.45)
+})
 group('charProgress · isCharTimed')
 
 test('chars 非数组 / 空数组 → false', () => {
@@ -5941,6 +6016,39 @@ test('有一个 t 不是有限数 → false（NaN 会让进度色静默失效）
   assert.equal(isCharTimed({ chars: [{ c: 'a', t: 0 }, { c: 'b' }] }), false)
 })
 
+group('charProgress · 打轴粒度（纯英文按词，中文/混排按字）')
+
+test('纯英文 → 按词', () => {
+  assert.equal(tapUnitModeOf('Hello world'), 'word')
+  assert.equal(tapUnitModeOf('Hi!'), 'word')
+  assert.equal(tapUnitModeOf('café naïve'), 'word')
+  assert.equal(tapUnitModeOf('Привет мир'), 'word')
+})
+
+test('中文 / 日文 / 韩文 / 泰文 → 按字（这些文字不按空格分词）', () => {
+  assert.equal(tapUnitModeOf('你好世界'), 'char')
+  assert.equal(tapUnitModeOf('こんにちは'), 'char')
+  assert.equal(tapUnitModeOf('안녕하세요'), 'char')
+  assert.equal(tapUnitModeOf('สวัสดี'), 'char')
+})
+
+test('中英混排 → 按字（混排行没有统一的词边界）', () => {
+  assert.equal(tapUnitModeOf('Hello 世界'), 'char')
+  assert.equal(tapUnitModeOf('我爱你 baby'), 'char')
+})
+
+test('没有字母（纯符号/纯数字/空串）→ 按字', () => {
+  assert.equal(tapUnitModeOf('123 456'), 'char')
+  assert.equal(tapUnitModeOf('—— …'), 'char')
+  assert.equal(tapUnitModeOf(''), 'char')
+  assert.equal(tapUnitModeOf(null), 'char')
+  assert.equal(tapUnitModeOf(undefined), 'char')
+})
+
+test('英文行里夹一个全角标点，不应退回逐字', () => {
+  assert.equal(tapUnitModeOf('Hello，world'), 'word', 'CJK 标点不算文字')
+})
+
 group('charProgress · splitChars（拆字 / 标点跟随 / 空格不单独成字）')
 
 const charsOf = (text) => splitChars(text).map((ch) => ch.c)
@@ -5954,12 +6062,33 @@ test('中文：标点跟随前一个字，不独立成字', () => {
   assert.deepEqual(charsOf('真的吗？'), ['真', '的', '吗？'])
 })
 
-test('英文：字母逐个拆，标点跟随前一个字母', () => {
-  assert.deepEqual(charsOf('Hi!'), ['H', 'i!'])
+test('英文：整词一个单元，标点并进词里（不拆字母）', () => {
+  assert.deepEqual(charsOf('Hi!'), ['Hi!'])
+  assert.deepEqual(charsOf('Hello world'), ['Hello ', 'world'])
+  assert.deepEqual(charsOf('Hello, world!'), ['Hello, ', 'world!'])
 })
 
-test('英文：空格并进前一个词（空格不单独成字、也不占一次打轴）', () => {
-  assert.deepEqual(charsOf('Hello world'), ['H', 'e', 'l', 'l', 'o ', 'w', 'o', 'r', 'l', 'd'])
+test('英文：词内撇号/连字符不拆词', () => {
+  assert.deepEqual(charsOf("don't stop"), ["don't ", 'stop'])
+  assert.deepEqual(charsOf('well-known song'), ['well-known ', 'song'])
+})
+
+test('英文：纯标点单元不单独占一次打轴（并进相邻的词）', () => {
+  assert.deepEqual(charsOf('a - b'), ['a - ', 'b'])
+  assert.deepEqual(charsOf('— Hello'), ['— Hello'])
+})
+
+test('英文：连续空白与行尾空白都并进前一个词', () => {
+  assert.deepEqual(charsOf('a   b'), ['a   ', 'b'])
+  assert.deepEqual(charsOf('Hello   '), ['Hello   '])
+})
+
+test('中英混排：退回逐字（一个字一个单元）', () => {
+  assert.deepEqual(charsOf('Hi 你好'), ['H', 'i ', '你', '好'])
+})
+
+test('splitLetters：字母级拆分的原始行为保持不变（中文路径仍在用它）', () => {
+  assert.deepEqual(splitLetters('Hi!').map((ch) => ch.c), ['H', 'i!'])
 })
 
 test('行首空白并入第一个字（不为它单独造一个字）', () => {
@@ -5976,14 +6105,26 @@ test('空串 → 空数组', () => {
 })
 
 test('拆字结果拼回来严格等于原文（渲染与导出都依赖这个等式）', () => {
-  const samples = ['你好，世界', "Hello world! it's ok.", '  前导空格', '你好 ， 世界', 'a b  c', '句末。']
+  const samples = [
+    '你好，世界',
+    "Hello world! it's ok.",
+    '  前导空格',
+    '你好 ， 世界',
+    'a b  c',
+    '句末。',
+    '  Hello,   world!  ',
+    'a - b',
+    'Hello，世界',
+    "it's 8 o'clock",
+  ]
   for (const s of samples) {
     assert.equal(splitChars(s).map((ch) => ch.c).join(''), s, '拼回来不等于原文：' + s)
   }
 })
 
-test('拆出来的字默认没有时间（t 为 null）', () => {
+test('拆出来的单元默认没有时间（t 为 null）', () => {
   for (const ch of splitChars('你好')) assert.equal(ch.t, null)
+  for (const ch of splitWords('Hello world')) assert.equal(ch.t, null)
 })
 
 test('isTappableChar：纯空白不可单独打轴，其余都可', () => {
@@ -6064,15 +6205,37 @@ test('中文逐字：打完一行自动换到下一行，光标归零', () => {
   assert.equal(st.lineIndex, 1)
 })
 
-test('英文逐字：空格不占一次打轴（10 次按键打完 Hello world）', () => {
+test('英文逐字：整词一个单元（两次空格打完 Hello world，不拆字母）', () => {
   const st = createCharTapState()
   const lines = [{ t: 0, text: 'Hello world' }]
   const got = []
-  for (let i = 0; i < 10; i++) got.push(charTapStep(st, lines, i + 0.5))
+  for (let i = 0; i < 2; i++) got.push(charTapStep(st, lines, i + 0.5))
 
-  assert.deepEqual(got.map((r) => r.c), ['H', 'e', 'l', 'l', 'o ', 'w', 'o', 'r', 'l', 'd'])
+  assert.deepEqual(got.map((r) => r.c), ['Hello ', 'world'])
   assert.ok(got.every((r) => r.ok), '不应出现被拒绝的按键')
-  assert.equal(st.drafts[0].length, 10, '空格并进了前一个字，总字数仍是 10')
+  assert.equal(st.drafts[0].length, 2, '一次空格吃下一个整词')
+  assert.deepEqual(st.drafts[0].map((ch) => ch.t), [0.5, 1.5], '每个词一个时间点')
+})
+
+test('英文逐字：打完最后一个词换到下一行（不把字母留成尾巴）', () => {
+  const st = createCharTapState()
+  const lines = [
+    { t: 0, text: 'Hold on' },
+    { t: 3, text: 'to me' },
+  ]
+  charTapStep(st, lines, 0.5)
+  const last = charTapStep(st, lines, 1.5)
+  assert.equal(last.nextLineIndex, 1, '整行打完必须前进到下一行')
+  assert.equal(last.nextCursor, 0)
+  assert.equal(st.lineIndex, 1)
+})
+
+test('英文逐字：中英混排行仍按字打（与以前一致）', () => {
+  const st = createCharTapState()
+  const lines = [{ t: 0, text: 'Hi 你好' }]
+  const got = []
+  for (let i = 0; i < 4; i++) got.push(charTapStep(st, lines, i + 1))
+  assert.deepEqual(got.map((r) => r.c), ['H', 'i ', '你', '好'])
 })
 
 test('标点跟随：标点那一次按键落在前一个字上，不产生独立的标点字', () => {
@@ -6086,7 +6249,7 @@ test('标点跟随：标点那一次按键落在前一个字上，不产生独�
 
 test('末行末字再按空格 → 覆盖末字（不能没反应）', () => {
   const st = createCharTapState()
-  const lines = [{ t: 0, text: 'ab' }]
+  const lines = [{ t: 0, text: '甲乙' }]
   charTapStep(st, lines, 1)
   charTapStep(st, lines, 2)
   assert.equal(st.cursor, 2, '本行打完后光标停在末尾之后')
@@ -6101,7 +6264,7 @@ test('末行末字再按空格 → 覆盖末字（不能没反应）', () => {
 
 test('撤销：还原时间并把光标一起退回去（否则再按空格会跳过该字）', () => {
   const st = createCharTapState()
-  const lines = [{ t: 0, text: 'abcd' }]
+  const lines = [{ t: 0, text: '甲乙丙丁' }]
   charTapStep(st, lines, 1)
   charTapStep(st, lines, 2)
   assert.equal(st.cursor, 2)
@@ -6149,7 +6312,7 @@ test('暂停：暂停期间音频时间不走，两次按键记下同一个时�
 
 test('暂停：墙钟过去多久都不影响记录的时间（禁用 Date.now/performance.now）', () => {
   const st = createCharTapState()
-  const lines = [{ t: 0, text: 'ab' }]
+  const lines = [{ t: 0, text: '甲乙' }]
   charTapStep(st, lines, 2)
   charTapStep(st, lines, 2)
   assert.deepEqual(st.drafts[0].map((ch) => ch.t), [2, 2], '暂停里等 30 秒也不能让时间变成 32')
@@ -6157,7 +6320,7 @@ test('暂停：墙钟过去多久都不影响记录的时间（禁用 Date.now/p
 
 test('恢复播放：时间继续按音频位置前进', () => {
   const st = createCharTapState()
-  const lines = [{ t: 0, text: 'abc' }]
+  const lines = [{ t: 0, text: '甲乙丙' }]
   charTapStep(st, lines, 1)
   charTapStep(st, lines, 1)
   charTapStep(st, lines, 1.7)
@@ -6166,7 +6329,7 @@ test('恢复播放：时间继续按音频位置前进', () => {
 
 test('倍速：0.5 倍速下时间逐字等于音频位置，不按按键间隔累加', () => {
   const st = createCharTapState()
-  const lines = [{ t: 0, text: 'abcd' }]
+  const lines = [{ t: 0, text: '甲乙丙丁' }]
   const audioTimes = [0, 0.5, 1.0, 1.5]
   for (const t of audioTimes) charTapStep(st, lines, t)
   assert.deepEqual(st.drafts[0].map((ch) => ch.t), audioTimes)
@@ -6174,7 +6337,7 @@ test('倍速：0.5 倍速下时间逐字等于音频位置，不按按键间隔�
 
 test('倍速切换后时间仍然只认音频位置（1x → 1.5x → 0.75x 混合）', () => {
   const st = createCharTapState()
-  const lines = [{ t: 0, text: 'abcdef' }]
+  const lines = [{ t: 0, text: '甲乙丙丁戊己' }]
   const audioTimes = [0, 1, 2, 3.5, 4.1, 4.9]
   for (const t of audioTimes) charTapStep(st, lines, t)
   assert.deepEqual(st.drafts[0].map((ch) => ch.t), audioTimes)
@@ -6182,7 +6345,7 @@ test('倍速切换后时间仍然只认音频位置（1x → 1.5x → 0.75x 混�
 
 test('重新定位：光标落到第一个还没打过的字', () => {
   const st = createCharTapState()
-  const lines = [{ t: 0, text: 'abcd' }]
+  const lines = [{ t: 0, text: '甲乙丙丁' }]
   charTapStep(st, lines, 1)
   charTapStep(st, lines, 2)
   assert.equal(charRelocateCursor(st.drafts[0]), 2, '前两个字打过了，应落到第三个')
@@ -6219,7 +6382,7 @@ group('charProgress · 持久化（localStorage + textHash 指纹）')
 
 test('序列化只存已打时间的字（字表可随时由正文重建）', () => {
   const st = createCharTapState()
-  const lines = [{ t: 0, text: 'abcd' }]
+  const lines = [{ t: 0, text: '甲乙丙丁' }]
   charTapStep(st, lines, 1)
   charTapStep(st, lines, 2)
   const raw = serializeCharState(st, charDraftTextHash(lines))
@@ -6246,9 +6409,36 @@ test('保存/恢复往返：已打时间、光标、行号都回来', () => {
 })
 
 test('恢复的字表是完整的（未打的字不能消失，否则光标会跳过它们）', () => {
-  const hydrated = hydrateCharDraft('abcd', [{ c: 'a', t: 1 }])
-  assert.deepEqual(hydrated.map((ch) => ch.c), ['a', 'b', 'c', 'd'])
+  const hydrated = hydrateCharDraft('甲乙丙丁', [{ c: '甲', t: 1 }])
+  assert.deepEqual(hydrated.map((ch) => ch.c), ['甲', '乙', '丙', '丁'])
   assert.deepEqual(hydrated.map((ch) => ch.t), [1, null, null, null])
+})
+
+test('粒度迁移：老的字母级草稿按「字母拼成词」对齐，词取首字母的时间', () => {
+  const saved = [
+    { c: 'H', t: 5 },
+    { c: 'e', t: 5.1 },
+    { c: 'l', t: 5.2 },
+    { c: 'l', t: 5.3 },
+    { c: 'o ', t: 5.4 },
+    { c: 'w', t: 6 },
+    { c: 'o', t: 6.1 },
+    { c: 'r', t: 6.2 },
+    { c: 'l', t: 6.3 },
+    { c: 'd', t: 6.4 },
+  ]
+  const hydrated = hydrateCharDraft('Hello world', saved)
+  assert.deepEqual(hydrated.map((ch) => ch.c), ['Hello ', 'world'])
+  assert.deepEqual(hydrated.map((ch) => ch.t), [5, 6], '词的时间 = 这个词第一个字母的时间')
+})
+
+test('粒度迁移：拼接对不上就整行放弃（宁可未打，也不错位）', () => {
+  // 旧草稿是 'Hel' + 'lo'，拼起来是 'Hello'，但当前单元是 'Hello world'
+  const hydrated = hydrateCharDraft('Hello world', [
+    { c: 'Hel', t: 1 },
+    { c: 'lo', t: 2 },
+  ])
+  assert.deepEqual(hydrated.map((ch) => ch.t), [null, null])
 })
 
 test('指纹不符（歌词改过）→ 整份丢弃，不静默错位', () => {
@@ -6287,8 +6477,8 @@ test('正文改过、一个字都对不上 → 该行不留草稿', () => {
 })
 
 test('正文局部改过：能对上的字保留时间，对不上的回到未打（不错位）', () => {
-  const saved = { 0: [{ c: 'a', t: 1 }, { c: 'X', t: 2 }] }
-  const aligned = alignSavedDrafts(saved, [{ t: 0, text: 'ab' }])
+  const saved = { 0: [{ c: '甲', t: 1 }, { c: 'X', t: 2 }] }
+  const aligned = alignSavedDrafts(saved, [{ t: 0, text: '甲乙' }])
   assert.equal(aligned[0][0].t, 1)
   assert.equal(aligned[0][1].t, null)
 })

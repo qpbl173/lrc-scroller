@@ -45,6 +45,25 @@ const FOLLOWING_PUNCT_RE =
 const BLANK_CHAR_RE = /^[\s\u3000]$/u
 
 /**
+ * 「不按空格分词」的文字：中日韩 + 泰/老/缅。
+ *
+ * 【为什么用这个集合判定"要不要按词"
+ * 逐字打轴的粒度必须跟着**书写系统**走：
+ *   中文「今天很好」— 一个字一个节奏，按词打会漏掉字内的拍点；
+ *   英文「Hello world」— 字母没有独立节奏，按字母打只会得到一串
+ *   几乎等间隔的假时间点，用户还得按 11 次空格。
+ * 所以判定不是"是不是英文"，而是"这种文字有没有词间空格"。
+ *
+ * 【为什么不把 CJK 标点（\u3000-\u303F）算进来】
+ * 英文行里偶尔混一个全角逗号（"Hello，world"），标点不该让整行退回逐字。
+ * 这里只收真正的文字区段（含假名、谚文、注音、CJK 扩展）。
+ */
+const NO_WORD_SPACE_RE =
+  /[\u0E00-\u0EFF\u1000-\u109F\u1100-\u11FF\u3040-\u30FF\u3400-\u4DBF\u4E00-\u9FFF\uAC00-\uD7AF\uF900-\uFAFF]/
+
+/** 按空格分词的文字（拉丁 / 希腊 / 西里尔）。没有这些字母就谈不上"按词" */
+const WORD_LETTER_RE = /[A-Za-z\u00C0-\u024F\u0370-\u03FF\u0400-\u04FF]/
+
 /**
  * 逐字进度的插值模式。
  *
@@ -79,12 +98,20 @@ export const DEFAULT_CHAR_PROGRESS_MODE = /** @type {const} */ ('smooth')
  * 不该把最后一个字的时长硬拉到行尾（行尾可能是 5 秒后的间奏）——
  * 那会让整行颜色在半句之后一直空转。
  *
+ * 【weights 只给「按词打轴」用】
+ * 默认等权（每个单元 1/n 宽度）—— 中文逐字正好成立，一个字一格。
+ * 英文按词打轴时等权就错了：「I」和「extraordinary」各占 1/n，
+ * 扫色会在长词上突然变慢、在 "I" 上瞬间跳过。传 weights（= 每个单元的
+ * 宽度份额，见 unitWeights）就把份额按宽度分配，扫色速度才是均匀的。
+ * 不传 = 原有等权行为，一个像素都不变。
+ *
  * @param {Array<{c:string, t:number}>|null|undefined} chars
  * @param {number} timeSec
  * @param {"smooth"|"step"} [mode] 缺省 smooth（保持既有调用方行为不变）
+ * @param {number[]|null} [weights] 每个单元的宽度份额；缺省/长度不符时等权
  * @returns {number} 0..1
  */
-export function charProgressAt(chars, timeSec, mode = DEFAULT_CHAR_PROGRESS_MODE) {
+export function charProgressAt(chars, timeSec, mode = DEFAULT_CHAR_PROGRESS_MODE, weights = null) {
   if (!Array.isArray(chars) || chars.length === 0) return 0
   if (!Number.isFinite(timeSec)) return 0
 
@@ -108,13 +135,73 @@ export function charProgressAt(chars, timeSec, mode = DEFAULT_CHAR_PROGRESS_MODE
     else hi = mid - 1
   }
 
+  // 权重表必须与 chars 等长，否则一律退回等权（脏数据不能改变进度口径）
+  const useWeights = Array.isArray(weights) && weights.length === n
+
+  /** 取第 i 个单元的权重；0/负数/非数都退回 1，绝不产生除零 */
+  const weightOf = (i) => {
+    if (!useWeights) return 1
+    const v = Number(/** @type {number[]} */ (weights)[i])
+    return Number.isFinite(v) && v > 0 ? v : 1
+  }
+
   // step 模式：不做字内插值，落在第 lo 个字就算 lo 个字已唱完
-  if (mode === 'step') return lo / n
+  if (mode === 'step') {
+    if (!useWeights) return lo / n
+    let done = 0
+    let sum = 0
+    for (let i = 0; i < n; i++) {
+      const w = weightOf(i)
+      sum += w
+      if (i < lo) done += w
+    }
+    return sum > 0 ? done / sum : 0
+  }
 
   const span = chars[lo + 1].t - chars[lo].t
   // 防御：脏数据（NaN 时间）也可能走到这里，宁可退化成「整字完成」也不要 NaN
   const ratio = span > 0 ? (timeSec - chars[lo].t) / span : 0
-  return (lo + ratio) / n
+
+  if (!useWeights) return (lo + ratio) / n
+
+  // 加权：已完成单元的份额 + 当前单元按 ratio 折进来的那一部分
+  let done = 0
+  let sum = 0
+  let curWeight = 1
+  for (let i = 0; i < n; i++) {
+    const w = weightOf(i)
+    sum += w
+    if (i < lo) done += w
+    else if (i === lo) curWeight = w
+  }
+  return sum > 0 ? (done + ratio * curWeight) / sum : 0
+}
+
+/**
+ * 打轴单元的宽度份额（词级进度用）。
+ *
+ * 【为什么用「码点数」近似宽度】
+ * 逐字进度是一个**百分比**，渲染层再把它乘成像素宽。要让扫色看起来匀速，
+ * 份额就得跟着文字的实际横向占位走。而这里拿不到字体度量
+ * （纯函数层，预览与导出必须共用同一份，不能在浏览器里测量），
+ * 码点数是最便宜且足够准的近似：等宽字体下精确，比例字体下
+ * 长词/短词的误差也远小于「等权」造成的错误（"I" 与 "extraordinary" 同权）。
+ *
+ * 尾随空格也算一份 —— 它确实占了行内的一段宽度；
+ * 不计入的话每个词的结束位置都会比实际略早一点，累积起来就是可见的偏移。
+ *
+ * @param {Array<{c:string}>} chars
+ * @returns {number[]}
+ */
+export function unitWeights(chars) {
+  const n = Array.isArray(chars) ? chars.length : 0
+  const out = new Array(n)
+  for (let i = 0; i < n; i++) {
+    const c = chars[i] && typeof chars[i].c === 'string' ? chars[i].c : ''
+    const w = [...c].length
+    out[i] = w > 0 ? w : 1
+  }
+  return out
 }
 
 /**
@@ -231,6 +318,12 @@ export function partnerIndexesOf(lines, index) {
  * 翻译行如果有自己的 chars（历史数据/手动补过），优先用自己那份，
  * 不覆盖用户已有的精确数据。
  *
+ * 【词级行为什么要传权重】
+ * 英文行的单元是"词"，等权会让长短词的扫色速度差好几倍（"I" 瞬间跳过、
+ * "extraordinary" 拖得很慢）。词级行按宽度份额算，扫色才匀速。
+ * 判定用的是**行正文**而不是 chars 的形状：从增强 LRC 解析回来的词级
+ * 字表没有额外标记，靠正文才能认出"这是一行英文"。
+ *
  * @param {Array<any>} lines
  * @param {number} index
  * @param {number} timeSec
@@ -242,21 +335,54 @@ export function charProgressForLine(lines, index, timeSec, mode = DEFAULT_CHAR_P
   const line = arr[index]
   if (!line) return null
 
-  if (isCharTimed(line)) return charProgressAt(line.chars, timeSec, mode)
+  if (isCharTimed(line)) return charProgressAt(line.chars, timeSec, mode, weightsForLine(line))
 
   const main = mainLineIndexOf(arr, index)
   if (main >= 0 && main !== index) {
     const target = arr[main]
-    if (target && isCharTimed(target)) return charProgressAt(target.chars, timeSec, mode)
+    if (target && isCharTimed(target)) {
+      return charProgressAt(target.chars, timeSec, mode, weightsForLine(target))
+    }
   }
   return null
+}
+
+/**
+ * 某一行的进度权重：词级行给宽度份额，其余返回 null（= 等权）。
+ *
+ * 权重按 chars 数组缓存：播放时每帧都会为可见的每一行调用一次，
+ * 而 chars 数组在一次播放里是不变的（改歌词会换新数组）——
+ * 缓存掉的不只是 allocation，还有每帧 O(n) 的重新计算。
+ * 用 WeakMap 是为了让旧歌词的缓存随数组一起被回收，不需要手动清理。
+ * @type {WeakMap<object, number[]>}
+ */
+const weightCache = new WeakMap()
+
+/**
+ * @param {any} line
+ * @returns {number[]|null} null = 用等权
+ */
+function weightsForLine(line) {
+  const chars = line && line.chars
+  if (!Array.isArray(chars) || chars.length === 0) return null
+
+  // 行正文缺失（只解析出 chars 的极老数据）→ 用字表拼回来判定，结论一样
+  const text =
+    typeof line.text === 'string' ? line.text : chars.map((ch) => (ch && typeof ch.c === 'string' ? ch.c : '')).join('')
+  if (tapUnitModeOf(text) !== 'word') return null
+
+  const hit = weightCache.get(chars)
+  if (hit && hit.length === chars.length) return hit
+  const w = unitWeights(chars)
+  weightCache.set(chars, w)
+  return w
 }
 
 // ── 拆字（标点跟随前字，空格不单独成字）──────────
 
 /**
- * 一个字符是否可以单独打轴（纯空白不算）。
- * 拆字结果里本来就不该出现纯空白字（空格都被并进前一个字了），
+ * 一个打轴单元是否可以单独打轴（纯空白不算）。
+ * 拆字结果里本来就不该出现纯空白单元（空格都被并进前一个字了），
  * 这个判断是为「恢复出来的脏草稿」和「整行全是空格」准备的兜底。
  * @param {string} c
  * @returns {boolean}
@@ -267,7 +393,129 @@ export function isTappableChar(c) {
 }
 
 /**
- * 把一行正文拆成逐字数组（未打轴时 t 全为 null）。
+ * 这一行该按「字」还是按「词」打轴。
+ *
+ * 【规则：跟书写系统走，而不是跟"语言"标签走】
+ * - 纯英文/西文（有空格分词、无中日韩泰缅文字）→ 'word'
+ *   一次空格吃下一个整词，标点并进词里（"world!" 是一个单元）。
+ * - 含中文/日文/韩文/泰文，或者一个字母都没有（纯符号）→ 'char'
+ *   一个字一次按键，与既有行为完全一致。
+ *
+ * 【为什么不用"是否全 ASCII"】
+ * 英文歌词里常带重音字母（café、naïve）与弯引号，/^[\x00-\x7F]*$/ 会把
+ * 它们判成中文模式，白拆一堆字母。这里只排除"真正的非分词文字"。
+ *
+ * @param {unknown} text
+ * @returns {'char'|'word'}
+ */
+export function tapUnitModeOf(text) {
+  if (typeof text !== 'string' || text === '') return 'char'
+  if (NO_WORD_SPACE_RE.test(text)) return 'char'
+  if (!WORD_LETTER_RE.test(text)) return 'char'
+  return 'word'
+}
+
+/**
+ * 按「词」拆分（纯英文行用）：一个空格分隔的整词是一个打轴单元。
+ *
+ * 【三条规则（与逐字版同构，只是把"字"换成"词"】
+ * 1. 空白是最强的词边界：遇到空白就把当前词闭合，空白本身并进这个词
+ *    （"Hello " 是一个单元）。并进而不是丢掉，是因为渲染层依赖
+ *    「所有单元的 c 拼起来 === line.text」这个等式 —— 丢了空格，
+ *    预览的换行位置与导出就对不上了。
+ * 2. 词内字符（撇号、连字符、词尾标点）一律留在词里：
+ *    "don't" / "well-known" / "world!" 都各自是一个单元，不拆开。
+ * 3. 纯标点单元没有自己的节奏 → 并进前一个词；行首的并进后一个词。
+ *    绝不单独要求用户给一个破折号按一次空格。
+ *
+ * @param {string} text
+ * @returns {Array<{c:string, t:number|null}>}
+ */
+export function splitWords(text) {
+  /** @type {Array<{c:string, t:number|null}>} */
+  const out = []
+  if (typeof text !== 'string' || text === '') return out
+
+  /** 行首的空白，等第一个词来了并进去 */
+  let pending = ''
+  /** 当前词是否还"开着"（上一个字符不是空白） */
+  let open = false
+
+  for (const ch of text) {
+    if (BLANK_CHAR_RE.test(ch)) {
+      if (out.length > 0) {
+        // 规则 1/2：空白并进前一个词，并把那个词闭合
+        out[out.length - 1].c += ch
+        open = false
+      } else {
+        pending += ch
+      }
+      continue
+    }
+    if (open) {
+      // 规则 2：词内字符（含撇号/连字符/词尾标点）继续挂在当前词上
+      out[out.length - 1].c += ch
+      continue
+    }
+    out.push({ c: pending + ch, t: null })
+    pending = ''
+    open = true
+  }
+
+  if (out.length === 0) {
+    // 整行只有空白（词模式下实际不会发生，兜底保证不丢内容）
+    out.push({ c: pending, t: null })
+    return out
+  }
+
+  /*
+   * 规则 3：合并纯标点单元。
+   * 两遍处理是必要的：行首的标点要并进**后**一个词，
+   * 而这一步在单遍里还不知道"后面还有没有词"。
+   */
+  const merged = []
+  for (const unit of out) {
+    if (FOLLOWING_PUNCT_RE.test(unit.c)) {
+      if (merged.length > 0) {
+        merged[merged.length - 1].c += unit.c
+        continue
+      }
+      // 还没有前一个词 → 先占位，等下一个词来把它吃掉
+      merged.push(unit)
+      continue
+    }
+    if (merged.length === 1 && FOLLOWING_PUNCT_RE.test(merged[0].c)) {
+      merged[0].c += unit.c
+      continue
+    }
+    merged.push(unit)
+  }
+  // 整行全是标点（没有任何词）→ 全并进第一个单元，只留一次按键
+  if (merged.length > 1 && merged.every((u) => FOLLOWING_PUNCT_RE.test(u.c))) {
+    const all = merged.map((u) => u.c).join('')
+    return [{ c: all, t: null }]
+  }
+  return merged
+}
+
+/**
+ * 把一行正文拆成**打轴单元**（未打轴时 t 全为 null）。
+ *
+ * 【粒度按行决定】
+ * 纯英文行按词（见 splitWords），其余按字（见 splitLetters）。
+ * 上层（store / 应用 / 持久化）只认这一个函数，所以"英文按词"
+ * 这条规则只存在一份实现 —— 不会出现"打轴按词、渲染按字母"的错位。
+ *
+ * @param {string} text
+ * @returns {Array<{c:string, t:number|null}>}
+ */
+export function splitChars(text) {
+  if (tapUnitModeOf(text) === 'word') return splitWords(text)
+  return splitLetters(text)
+}
+
+/**
+ * 把一行正文按「字」拆开（中文/混排行的粒度）。
  *
  * 【三条规则（与解析器产出的 chars 语义一致）】
  * 1. 标点跟随前一个字：你好，世界 → ['你','好，','世','界']。
@@ -280,7 +528,7 @@ export function isTappableChar(c) {
  * @param {string} text
  * @returns {Array<{c:string, t:number|null}>}
  */
-export function splitChars(text) {
+export function splitLetters(text) {
   /** @type {Array<{c:string, t:number|null}>} */
   const out = []
   if (typeof text !== 'string' || text === '') return out
@@ -656,6 +904,15 @@ export function parseCharState(raw, expectedHash) {
  * 按顺序对齐，对不上的字自然回到未打状态 —— 这正好是
  * 需求 6 要的「文本变了 → chars 置 null，不静默错位」。
  *
+ * 【粒度改过怎么办（字母草稿 → 词级单元）】
+ * 英文从"按字母打"改成"按词打"之后，老草稿里存的是 'H','e','l','l','o '…
+ * 而当前单元是 'Hello '。同粒度对齐会一个字都对不上，整行草稿就白丢了。
+ * 所以同粒度对齐一条都没命中时，再试一次「按文字拼接对齐」：
+ * 把若干个旧片段拼成一个当前单元，词的时间取它**第一个**片段的
+ * （第一个字母开口的时刻，正是这个词开始唱的时刻）。
+ * 拼接必须严格逐字相等才接受 —— 只要有一处拼不上，就退回"整行未打"，
+ * 绝不为了多救几个字而错位。
+ *
  * @param {string} text 当前行的正文
  * @param {Array<{c:string, t:number}>|null|undefined} saved
  * @returns {Array<{c:string, t:number|null}>}
@@ -671,7 +928,33 @@ export function hydrateCharDraft(text, saved) {
       j++
     }
   }
-  return chars
+  // 同粒度已经对上（至少一条）→ 就用它，不再做拼接推断
+  if (chars.some((ch) => Number.isFinite(ch.t))) return chars
+
+  return hydrateByConcat(chars, saved) ?? chars
+}
+
+/**
+ * 把「更细粒度的旧草稿」按文字拼接对齐到当前单元上（见 hydrateCharDraft 说明）。
+ * @param {Array<{c:string, t:number|null}>} units 当前单元（会被就地写入 t）
+ * @param {Array<{c:string, t:number}>} saved 旧草稿（已按顺序）
+ * @returns {Array<{c:string, t:number|null}>|null} 拼不齐 → null
+ */
+function hydrateByConcat(units, saved) {
+  let j = 0
+  for (const unit of units) {
+    if (j >= saved.length) return null
+    const start = j
+    let acc = ''
+    while (j < saved.length && acc.length < unit.c.length) {
+      acc += saved[j].c
+      j++
+    }
+    if (acc !== unit.c) return null
+    unit.t = Number.isFinite(saved[start].t) ? saved[start].t : null
+  }
+  // 旧草稿还剩着 → 说明根本没对齐（例如正文变长了），整行不可信
+  return j === saved.length ? units : null
 }
 
 /**

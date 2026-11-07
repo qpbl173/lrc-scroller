@@ -262,7 +262,11 @@ function cycleRate() {
       type="button"
       :aria-label="tapping.charMode ? '退出逐字打轴' : '进入逐字打轴'"
       :aria-pressed="tapping.charMode"
-      title="逐字打轴：空格给当前字打时间点（标点跟随前一个字）"
+      :title="
+        tapping.charUnitMode === 'word'
+          ? '逐字打轴：空格给当前单词打时间点（英文整词一个单元，不拆字母）'
+          : '逐字打轴：空格给当前字打时间点（标点跟随前一个字）'
+      "
       @click="onToggleChar"
     >
       逐字
@@ -287,8 +291,8 @@ function cycleRate() {
       <button
         class="playerbar__tap playerbar__char-step"
         type="button"
-        aria-label="光标退一个字"
-        title="← 光标退一个字（重打打错的字）"
+        :aria-label="`光标退一个${tapping.charUnitName}`"
+        :title="`← 光标退一个${tapping.charUnitName}（重打打错的那一处）`"
         @click="onCharStep(-1)"
       >
         ←
@@ -296,8 +300,8 @@ function cycleRate() {
       <button
         class="playerbar__tap playerbar__char-step"
         type="button"
-        aria-label="光标进一个字"
-        title="→ 光标进一个字"
+        :aria-label="`光标进一个${tapping.charUnitName}`"
+        :title="`→ 光标进一个${tapping.charUnitName}`"
         @click="onCharStep(1)"
       >
         →
@@ -340,15 +344,19 @@ function cycleRate() {
     </span>
 
     <!--
-      逐字进度标记：第几行 / 共几行 + 行内已打字数。
+      逐字进度标记：第几行 / 共几行 + 行内已打单元数。
+      单元名跟着行粒度走：英文行是「词」，中文行是「字」——
+      英文行若还写"字"，用户会以为自己在数字母。
+
       与逐行的「打轴中 N/M」并列存在时可能同时出现（两套草稿并存），
       所以文案必须能区分，不能都叫"打轴中"。
     -->
     <span v-if="tapping.charMode" class="playerbar__tapping playerbar__char-progress" role="status">
       <template v-if="charLineTotal > 0">
-        逐字 {{ tapping.charLineIndex + 1 }}/{{ tappingTotal }} · {{ charLineTimed }}/{{ charLineTotal }} 字
+        逐字 {{ tapping.charLineIndex + 1 }}/{{ tappingTotal }} · {{ charLineTimed }}/{{ charLineTotal }}
+        {{ tapping.charUnitName }}
       </template>
-      <template v-else>逐字 · 该行无字可打</template>
+      <template v-else>逐字 · 该行没有可打的{{ tapping.charUnitName }}</template>
     </span>
 
     <span class="playerbar__time">{{ timeText }}</span>

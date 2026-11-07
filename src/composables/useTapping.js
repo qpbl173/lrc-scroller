@@ -392,7 +392,7 @@ export function useTapping() {
         ui.push({
           level: 'info',
           message: '已恢复逐字打轴草稿',
-          hint: '空格给当前字打时间 · 逐字模式可暂停播放慢慢打',
+          hint: `空格给当前${tapping.charUnitName}打时间 · 逐字模式可暂停播放慢慢打`,
         })
       } else if (tapping.totalCount === 0) {
         ui.push({
@@ -404,7 +404,10 @@ export function useTapping() {
         ui.push({
           level: 'info',
           message: '已进入逐字打轴模式',
-          hint: '空格给当前字打时间点 · 标点跟随前一个字',
+          hint:
+            tapping.charUnitMode === 'word'
+              ? '空格给当前单词打时间点 · 英文按整词打，不拆字母'
+              : '空格给当前字打时间点 · 标点跟随前一个字',
         })
       }
     } else {

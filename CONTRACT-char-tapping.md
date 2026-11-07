@@ -83,3 +83,44 @@ export function charProgressAt(chars, timeSec, mode = DEFAULT_CHAR_PROGRESS_MODE
 ### applyChars 的 tapTargetKind 闸
 只认 `tapTargetKind === 'lines'`。混合文件里 tapTarget 指向无时间的 droppedLines，
 按下标写进 lyrics.lines 会拿 A 行的字改 B 行（静默错位）。
+
+## v1.1 打轴粒度：纯英文按词（2026-11）
+
+### 规则
+粒度按**行的书写系统**决定，不按"用户点了哪个模式"：
+
+| 行内容 | 粒度 | 例子 |
+| --- | --- | --- |
+| 纯英文/西文（无中日韩泰缅文字，且含字母） | 词 | `Hello, world!` → `['Hello, ', 'world!']` |
+| 含中文/日文/韩文/泰文 | 字 | `你好，世界` → `['你', '好，', '世', '界']` |
+| 中英混排 | 字 | `Hi 你好` → `['H', 'i ', '你', '好']` |
+| 没有字母（纯符号/数字） | 字 | 保持原行为 |
+
+判定函数：`tapUnitModeOf(text) -> 'char' | 'word'`（core，唯一一份实现）。
+拆分入口仍是 `splitChars(text)`，内部按模式分派到 `splitWords` / `splitLetters`。
+
+### 词级拆分的四条约束
+1. 空白闭合当前词，并**并进这个词**（`'Hello '` 是一个单元）——
+   `chars` 拼回来必须严格等于 `line.text`，渲染换行与导出都依赖这个等式。
+2. 词内字符（撇号、连字符、词尾标点）不拆：`don't` / `well-known` / `world!`。
+3. 纯标点单元不占一次打轴：并进前一个词；行首的并进后一个词。
+4. 粒度对同一份歌词是确定性的 —— 草稿恢复、应用、导出都靠它重建字表，
+   不能依赖任何运行时状态。
+
+### 进度公式：词级必须传权重
+等权（每个单元 1/n）只对中文逐字成立。英文按词时 `I` 与 `extraordinary`
+同权会让扫色速度差数倍，所以词级行走**宽度份额**：
+
+```js
+charProgressAt(chars, timeSec, mode, weights)   // weights 缺省 = 等权，行为不变
+unitWeights(chars)                              // 份额 = 码点数（含尾随空格）
+```
+
+`charProgressForLine` 内部按行正文判定模式并自动传权重（预览与导出共用），
+权重按 `chars` 数组 WeakMap 缓存（播放时每帧调用，不能每帧重算）。
+
+### 不受影响的部分
+- 状态机（`charTapStep` / `charUndoStep` / 持久化 / 应用）只认"单元"，不需要知道粒度。
+- 增强 LRC 写出与解析：词级单元往返实测精确
+  （`[00:05.00]<00:05.00>Hello, <00:06.00>world!` → 解析回同样的两个单元）。
+- 双语规则（只打主行、翻译行跟随百分比）不变。
