@@ -36,7 +36,7 @@
  * 横向同理按 scale 缩放舞台宽度，于是换行位置也与预览一致 ——
  * 画布比舞台"更宽"时多出来的部分用背景色补边（用户看不到接缝）。
  */
-import { charProgressAt, isCharTimed } from './charProgress.js'
+import { charProgressForLine } from './charProgress.js'
 import { hexToRgb } from './color.js'
 import { computeRenderOpacities, createDefaultFade } from './fade.js'
 import { smoothTowards, computeCenteringOffset } from './scroll.js'
@@ -1151,13 +1151,16 @@ const charProgressColor = settings?.color?.charProgress ?? '#4c8dff'
    * 所以这里直接用 i 取 lines[i] 是安全的。
    *
    * 【与预览调用同一个函数】
-   * StageView.charProgressOf 也调 charProgressAt。同一个公式、同一个时间源，
-   * 预览与导出才谈得上几何一致。
+   * StageView.charProgressOf 也调 charProgressForLine。同一个公式、同一个时间源，
+   * 预览与导出才谈得上几何一致；翻译行跟随主行百分比这条规则也只有一份。
    */
   function charProgressOf(i) {
-    const line = lines[i]
-    if (!line || !isCharTimed(line)) return null
-    return charProgressAt(line.chars, t)
+    /*
+     * 走 core 的统一入口：翻译行自己没有逐字时间时，跟随同组主行的百分比。
+     * 预览（StageView）调的是同一个函数 —— 两处若各写一套判断，就会出现
+     * "预览里翻译行跟着动、导出里不动"这类无法验收的偏差。
+     */
+    return charProgressForLine(lines, i, t)
   }
 
   /*

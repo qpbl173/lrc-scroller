@@ -29,7 +29,7 @@ import { registerTappingAuto } from '@/composables/useTapping'
 import { registerAutoScroll, registerTapping } from '@/devtools/diagHooks'
 import { buildLogicalRows, createFadeEngine } from '@/core/fade'
 import LyricLine from '@/components/LyricLine.vue'
-import { charProgressAt, isCharTimed } from '@/core/charProgress'
+import { charProgressForLine } from '@/core/charProgress'
 import UntimedLine from '@/components/UntimedLine.vue'
 import LyricsInfoPanel from '@/components/LyricsInfoPanel.vue'
 import { DEFAULT_ASPECT, aspectCssValue, findAspect } from '@/core/settings'
@@ -166,9 +166,8 @@ function opacityOf(index) {
  * @returns {number|null}
  */
 function charProgressOf(i) {
-  const line = lyrics.lines[i]
-  if (!line || !isCharTimed(line)) return null
-  return charProgressAt(line.chars, player.currentTime)
+  // 翻译行没有自己的逐字时间时跟随主行的百分比（与导出同一个函数）
+  return charProgressForLine(lyrics.lines, i, player.currentTime)
 }
 
 /*
@@ -435,6 +434,32 @@ const isTappingUntimed = computed(() => tapping.enabled && tapping.tapTargetKind
 const isTappingLines = computed(() => tapping.enabled && tapping.tapTargetKind === 'lines')
 
 /**
+ * 打轴光标是否落在这一行（双语时整组都算）。
+ *
+ * 光标停在原文上、翻译行跟随同一个时间点 —— 只标原文会让用户以为译文没被处理。
+ * 判定用的是与 .is-active 同一份逻辑行映射，不另造一套。
+ * @param {number} i
+ */
+function isEditingRow(i) {
+  if (!isTappingLines.value) return false
+  const cur = tapping.editingIndex
+  if (i === cur) return true
+  const rowOf = logicalRowOf.value
+  if (!rowOf || cur < 0 || i < 0) return false
+  return rowOf[i] === rowOf[cur]
+}
+
+/** 刚打完的那一行（双语时整组都算） */
+function isTappedRow(i) {
+  if (!isTappingLines.value) return false
+  const cur = tapping.lastTappedIndex
+  if (i === cur) return true
+  const rowOf = logicalRowOf.value
+  if (!rowOf || cur < 0 || i < 0) return false
+  return rowOf[i] === rowOf[cur]
+}
+
+/**
  * 是否显示"还没有歌词"空状态。
  *
  * 【为什么 untimedRows 存在时就不显示空状态】
@@ -519,8 +544,8 @@ const showEmpty = computed(() => !hasLyrics.value && !showUntimed.value && !tapp
             :index="i"
             :active="isActiveRow(i)"
             :past="activeIndex >= 0 && i < activeIndex"
-            :editing="isTappingLines && i === tapping.editingIndex"
-            :tapped="isTappingLines && i === tapping.lastTappedIndex"
+            :editing="isEditingRow(i)"
+            :tapped="isTappedRow(i)"
             :opacity="opacityOf(i)"
             :char-progress="charProgressOf(i)"
           />

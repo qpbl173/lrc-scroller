@@ -187,6 +187,10 @@ import {
 } from '../src/core/lrcWriter.js'
 import {
   charProgressAt,
+  charProgressForLine,
+  mainLineIndexOf,
+  partnerIndexesOf,
+  tapSlotIndexes,
   isCharTimed,
   splitChars,
   isTappableChar,
@@ -3283,6 +3287,118 @@ test('左对齐 / 右对齐：裁剪同样按"行左缘 → 行宽 × 进度"计
     `右对齐应从 ${(1280 - w).toFixed(1)} 起，实际 ${rR.x.toFixed(1)}`,
   )
   assert.ok(Math.abs(rR.w - w) < 1, `p=1 应覆盖整行，实际 ${rR.w.toFixed(1)}`)
+})
+
+group('双语打轴 · 翻译行跟随主行（时间与逐字百分比）')
+
+test('mainLineIndexOf：翻译行指回同组主行，主行指回自己', () => {
+  const lines = [
+    { t: 0, text: '原文', isTranslation: false },
+    { t: 0, text: 'trans', isTranslation: true },
+    { t: 5, text: '下一句', isTranslation: false },
+    { t: 5, text: 'next', isTranslation: true },
+    { t: 5, text: 'second trans', isTranslation: true },
+  ]
+  assert.equal(mainLineIndexOf(lines, 1), 0, '翻译行应指回原文')
+  assert.equal(mainLineIndexOf(lines, 0), 0, '主行指向自己')
+  assert.equal(mainLineIndexOf(lines, 4), 2, '同组两条翻译都指回同一条主行')
+  assert.equal(mainLineIndexOf(lines, 2), 2)
+  assert.equal(mainLineIndexOf(lines, 99), -1, '越界返回 -1')
+  assert.equal(mainLineIndexOf(null, 0), -1)
+})
+
+test('tapSlotIndexes：双语只留主行（翻译行不单独打轴）', () => {
+  const lines = [
+    { t: 0, text: '原文一' },
+    { t: 0, text: 'trans one', isTranslation: true },
+    { t: 3, text: '原文二' },
+    { t: 3, text: 'trans two', isTranslation: true },
+    { t: 6, text: '原文三' },
+  ]
+  assert.deepEqual(tapSlotIndexes(lines), [0, 2, 4], '只留 3 条主行，序号仍是 lines 的下标')
+})
+
+test('tapSlotIndexes：全是翻译行时退回全部（否则一行都打不了）', () => {
+  const lines = [
+    { t: 0, isTranslation: true },
+    { t: 1, isTranslation: true },
+  ]
+  assert.deepEqual(tapSlotIndexes(lines), [0, 1])
+  assert.deepEqual(tapSlotIndexes(null), [], '非法输入返回空数组')
+})
+
+test('partnerIndexesOf：主行带出同组翻译行，且不会跨到下一组', () => {
+  const lines = [
+    { t: 0, text: '原文一' },
+    { t: 0, text: 'trans one', isTranslation: true },
+    { t: 0, text: 'trans one again', isTranslation: true },
+    { t: 3, text: '原文二' },
+    { t: 3, text: 'trans two', isTranslation: true },
+  ]
+  assert.deepEqual(partnerIndexesOf(lines, 0).sort(), [1, 2], '同组两条翻译都跟随')
+  assert.deepEqual(partnerIndexesOf(lines, 3), [4], '不会把上一组算进来')
+  assert.deepEqual(partnerIndexesOf(lines, 1), [], '翻译行自己不作为主行')
+  assert.deepEqual(partnerIndexesOf(lines, 99), [])
+})
+
+test('charProgressForLine：翻译行没有字时间时，用主行的百分比', () => {
+  const main = {
+    t: 0,
+    text: 'abcd',
+    isTranslation: false,
+    chars: [
+      { c: 'a', t: 0 },
+      { c: 'b', t: 1 },
+      { c: 'c', t: 2 },
+      { c: 'd', t: 3 },
+    ],
+  }
+  const tr = { t: 0, text: 'wxyz', isTranslation: true, chars: null }
+  const lines = [main, tr]
+
+  assert.equal(charProgressForLine(lines, 0, 1.5), 0.375, '主行按自己的字算')
+  assert.equal(charProgressForLine(lines, 1, 1.5), 0.375, '翻译行跟随主行同一个百分比')
+  assert.equal(charProgressForLine(lines, 1, 0), 0, '还没开始唱时是 0')
+  assert.equal(charProgressForLine(lines, 1, 99), 1, '唱完后是 1（整行覆盖）')
+})
+
+test('charProgressForLine：翻译行自己有字时间时优先用自己的', () => {
+  const main = { t: 0, text: 'ab', isTranslation: false, chars: [{ c: 'a', t: 0 }, { c: 'b', t: 2 }] }
+  const tr = { t: 0, text: 'cd', isTranslation: true, chars: [{ c: 'c', t: 0 }, { c: 'd', t: 4 }] }
+  // 翻译行的字表是 0/4 秒：t=1 时第一个字走了 1/4 → 整行 (0+0.25)/2 = 0.125
+  // 主行是 0/2 秒：同样的 t=1 已经走到一半 → (0+0.5)/2 = 0.25
+  // 两者不同，正好能验证"优先用自己的字表"，而不是回退到主行
+  assert.equal(charProgressForLine([main, tr], 1, 1), 0.125, '翻译行用自己的字表')
+  assert.equal(charProgressForLine([main, tr], 0, 1), 0.25, '主行按自己的字算')
+})
+
+test('charProgressForLine：没有逐字数据的普通行返回 null（不输出任何进度样式）', () => {
+  const lines = [{ t: 0, text: '普通', isTranslation: false }]
+  assert.equal(charProgressForLine(lines, 0, 1), null)
+})
+
+test('导出：翻译行没有字时间时也按主行百分比从左往右覆盖', () => {
+  const main = makeCharLine('abcd', 0, 1) // p = 0.375 at t=1.5
+  const tr = { t: 0, text: 'efgh', isTranslation: true, empty: false }
+  const lines = [main, tr]
+  const probe = drawAt(scrollSettings, lines, 1.5)
+  const rects = clipRects(probe)
+  assert.equal(rects.length, 2, `主行与翻译行都应有一段进度裁剪，实际 ${rects.length} 段`)
+
+  const size = 40 * (720 / 776)
+  const trSize = size * 0.62
+  const ls = scrollSettings.font.letterSpacing
+  const wMain = 4 * size + 3 * size * ls
+  const wTr = 4 * trSize + 3 * trSize * ls
+  const p = 0.375
+  const scale = 1.35
+
+  const widths = rects.map((r) => r.w).sort((a, b) => a - b)
+  const expect = [wTr * p * scale, wMain * p * scale].sort((a, b) => a - b)
+  assert.ok(
+    Math.abs(widths[0] - expect[0]) < 2 && Math.abs(widths[1] - expect[1]) < 2,
+    `两段进度宽度应分别为 ${expect.map((v) => v.toFixed(1))}，实际 ${widths.map((v) => v.toFixed(1))}`,
+  )
 })
 
 group('renderFrame · 画布绘制结果（插桩验证导出到底画了什么）')

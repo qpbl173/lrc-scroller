@@ -10,7 +10,10 @@ import {
   charTapStep,
   charUndoStep,
   countTimedChars,
+  mainLineIndexOf,
   parseCharState,
+  partnerIndexesOf,
+  tapSlotIndexes,
   serializeCharState,
   splitChars,
 } from '@/core/charProgress'
@@ -181,21 +184,43 @@ export const useTappingStore = defineStore('tapping', {
       return useLyricsStore().droppedLines.length > 0 ? 'dropped' : 'lines'
     },
 
-    /** 应打的总行数（按目标数组算，不再固定用 lines） */
-    totalCount() {
-      return this.tapTarget.length
+    /**
+     * 可打轴的行下标（"打轴槽位"）。
+     *
+     * 【为什么要把翻译行排除掉】
+     * 双语歌词里原文与翻译是同一时间的两个物理行。翻译没有自己的节奏，
+     * 让用户给译文也打一遍，只会得到与原文几乎重复的时间点（实测痛点）。
+     * 所以：只打原文，翻译行的时间与进度都跟随主行。
+     *
+     * 【极端情况兜底】
+     * 整份文件都是翻译行（数据异常）时退回"全部行"，否则会一行都打不了。
+     */
+    tapSlotIndexes() {
+      // 规则在 core（同一份实现也被渲染/界面用到），store 只负责取目标数组
+      return tapSlotIndexes(this.tapTarget)
     },
 
-    /** 已打行数 */
+    /** 当前编辑行在槽位里的序号（1 起），用于"打轴中 3/9" */
+    tapSlotOrdinal(state) {
+      const pos = this.tapSlotIndexes.indexOf(state.editingIndex)
+      return pos >= 0 ? pos + 1 : 0
+    },
+
+    /** 应打的行数（不含翻译行） */
+    totalCount() {
+      return this.tapSlotIndexes.length
+    },
+
+    /** 已打的行数（只数槽位，翻译行是跟随的，不算进度） */
     tappedCount(state) {
-      return state.tapped.filter(Boolean).length
+      return this.tapSlotIndexes.filter((i) => Boolean(state.tapped[i])).length
     },
 
     /** 打轴进度 0~1；没有可打的行时返回 0 */
     progress(state) {
-      const total = this.tapTarget.length
+      const total = this.totalCount
       if (total === 0) return 0
-      return state.tapped.filter(Boolean).length / total
+      return this.tappedCount / total
     },
 
     /** 某一行的记录（未打为 null） */
@@ -265,6 +290,34 @@ export const useTappingStore = defineStore('tapping', {
 
   actions: {
     /**
+     * 与第 index 行同组、且需要跟随它的翻译行下标。
+     *
+     * 判定"同组"用的是目标数组里**当前**的时间（tapped 是草稿，不改 lines），
+     * 与 buildLogicalRows / 渲染层完全同一个口径：时间相同且相邻。
+     * @param {number} index
+     * @returns {number[]}
+     */
+    _tapPartners(index) {
+      return partnerIndexesOf(this.tapTarget, index)
+    },
+
+    /** 把任意下标收敛到最近的槽位（翻译行/越界都往后找，找不到往前退） */
+    _normalizeSlot(index) {
+      const slots = this.tapSlotIndexes
+      if (slots.length === 0) return 0
+      if (slots.indexOf(index) >= 0) return index
+      for (const i of slots) if (i >= index) return i
+      return slots[slots.length - 1]
+    },
+
+    /** 下一个槽位；没有返回 -1 */
+    _nextSlot(index) {
+      const slots = this.tapSlotIndexes
+      for (const i of slots) if (i > index) return i
+      return -1
+    },
+
+    /**
      * 打开打轴模式。
      * 首次进入时按**目标行数组**预填 tapped。
      * @returns {boolean} ensureSize 是否发生了重置（供调用方提示用户）
@@ -317,7 +370,8 @@ export const useTappingStore = defineStore('tapping', {
       // 目标切换（或行数变化）→ 重新开一份干净草稿
       this.tapped = new Array(n).fill(EMPTY)
       this.tappedKind = kind
-      this.editingIndex = 0
+      // 首行可能是翻译行（数据异常）→ 收敛到第一个可打的行
+      this.editingIndex = this.tapSlotIndexes.length ? this.tapSlotIndexes[0] : 0
       this.lastTappedIndex = -1
       this.undoStack = []
       this.done = false
@@ -402,13 +456,24 @@ export const useTappingStore = defineStore('tapping', {
       const n = this.tapped.length
       if (n === 0) return { index: -1, t, nextIndex: 0, isNew: false }
 
-      // 越界保护：editingIndex 必须在范围内
+      // 越界保护：editingIndex 必须落在可打轴的行上（翻译行会被跳过）
       if (this.editingIndex < 0) this.editingIndex = 0
       if (this.editingIndex > n - 1) this.editingIndex = n - 1
+      this.editingIndex = this._normalizeSlot(this.editingIndex)
 
       const i = this.editingIndex
       const prev = this.tapped[i]
       const isNew = prev === null
+
+      /*
+       * 双语：翻译行跟随主行。
+       * 打原文时把同组的翻译行一起写成同一个时间 —— 否则应用之后
+       * 译文还是旧时间，两句会被拆到不同的滚动位置。
+       */
+      const partners = this._tapPartners(i).map((k) => ({
+        index: k,
+        prev: this.tapped[k] ? { ...this.tapped[k] } : null,
+      }))
 
       // 记撤销点（覆盖也进栈 —— 用户可能想退回"没打"的状态）
       this.undoStack.push({
@@ -416,21 +481,24 @@ export const useTappingStore = defineStore('tapping', {
         prev: prev ? { ...prev } : null,
         prevEditing: this.editingIndex,
         prevLast: this.lastTappedIndex,
+        partners,
       })
       if (this.undoStack.length > UNDO_LIMIT) this.undoStack.shift()
 
       // 吸附（可能改写 t，并给出节拍序号）
       const snapped = this.snapToGrid(t)
       this.tapped[i] = { t: snapped.t, beat: snapped.beat, locked: false }
+      for (const p of partners) {
+        this.tapped[p.index] = { t: snapped.t, beat: snapped.beat, locked: false }
+      }
       this.lastTappedIndex = i
 
-      // 编辑行前进；**末行之后不越界**，停在末行
+      // 编辑行前进到下一个槽位；**末行之后不越界**，停在末行
       // （再次按空格会覆盖末行 —— 需求明确要求"不能没反应"）
-      if (i < n - 1) {
-        this.editingIndex = i + 1
-      }
+      const nextSlot = this._nextSlot(i)
+      if (nextSlot >= 0) this.editingIndex = nextSlot
 
-      this.done = this.tapped.every(Boolean)
+      this.done = this.tapSlotIndexes.every((k) => Boolean(this.tapped[k]))
       this._save()
       return { index: i, t: snapped.t, nextIndex: this.editingIndex, isNew }
     },
@@ -444,9 +512,15 @@ export const useTappingStore = defineStore('tapping', {
       const snap = this.undoStack.pop()
       if (!snap) return null
       this.tapped[snap.index] = snap.prev ? { ...snap.prev } : null
+      // 打轴时镜像过的翻译行要一起回滚（老快照没有 partners 字段，跳过即可）
+      if (Array.isArray(snap.partners)) {
+        for (const p of snap.partners) {
+          this.tapped[p.index] = p.prev ? { ...p.prev } : null
+        }
+      }
       this.editingIndex = snap.prevEditing
       this.lastTappedIndex = snap.prevLast
-      this.done = this.tapped.length > 0 && this.tapped.every(Boolean)
+      this.done = this.tapSlotIndexes.length > 0 && this.tapSlotIndexes.every((k) => Boolean(this.tapped[k]))
       this._save()
       return { index: snap.index, t: snap.prev ? snap.prev.t : null }
     },
@@ -475,6 +549,11 @@ export const useTappingStore = defineStore('tapping', {
 
       const next = Math.max(0, (rec.t + deltaMs / 1000))
       this.tapped[i] = { ...rec, t: next, locked: true }
+      // 翻译行跟随主行一起微调，否则微调后双语会错位
+      for (const k of this._tapPartners(i)) {
+        const p = this.tapped[k]
+        if (p) this.tapped[k] = { ...p, t: next, locked: true }
+      }
       this._save()
       return { index: i, t: next }
     },
@@ -507,7 +586,7 @@ export const useTappingStore = defineStore('tapping', {
       this.tapped = new Array(this.tapTarget.length).fill(EMPTY)
       this.tappedKind = this.tapTargetKind
       this.undoStack = []
-      this.editingIndex = 0
+      this.editingIndex = this.tapSlotIndexes.length ? this.tapSlotIndexes[0] : 0
       this.lastTappedIndex = -1
       this.done = false
       this.enabled = false
@@ -525,14 +604,15 @@ export const useTappingStore = defineStore('tapping', {
       this.undoStack = snap.undoStack
       this.editingIndex = snap.editingIndex
       this.lastTappedIndex = snap.lastTappedIndex
-      this.done = this.tapped.length > 0 && this.tapped.every(Boolean)
+      // 完成度只看可打的行（翻译行是跟随的，不该影响"是否打完"）
+      this.done = this.tapSlotIndexes.length > 0 && this.tapSlotIndexes.every((k) => Boolean(this.tapped[k]))
       this.enabled = true
       this._save()
     },
 
     /** 清空全部草稿（换歌词重来时用） */
     reset() {
-      this.editingIndex = 0
+      this.editingIndex = this.tapSlotIndexes.length ? this.tapSlotIndexes[0] : 0
       this.lastTappedIndex = -1
       // 按**目标数组**长度预填，不再是固定用 lines
       this.tapped = new Array(this.tapTarget.length).fill(EMPTY)
@@ -679,6 +759,9 @@ export const useTappingStore = defineStore('tapping', {
     charRelocate(lineIndex) {
       const n = this.tapTarget.length
       if (!Number.isInteger(lineIndex) || lineIndex < 0 || lineIndex >= n) return null
+      // 点到翻译行时落到它的主行上（翻译行不参与逐字打轴）
+      lineIndex = mainLineIndexOf(this.tapTarget, lineIndex)
+      if (lineIndex < 0) return null
       const chars = Array.isArray(this.charDraft[lineIndex])
         ? this.charDraft[lineIndex]
         : /** @type {any} */ (this._charBuildDraft(lineIndex))
@@ -708,8 +791,9 @@ export const useTappingStore = defineStore('tapping', {
       const n = this.tapTarget.length
       if (n === 0) return 0
       // 恢复草稿后 charLineIndex 可能越界（歌词变短了）
-      const idx = Math.min(Math.max(0, this.charLineIndex), n - 1)
-      this.charLineIndex = idx
+      // 翻译行没有自己的节奏 → 重定向到同组主行（与逐行打轴同一个规则）
+      const idx = mainLineIndexOf(this.tapTarget, Math.min(Math.max(0, this.charLineIndex), n - 1))
+      this.charLineIndex = idx >= 0 ? idx : 0
       const chars = this._charBuildDraft(idx)
       // 光标落在第一个没打过的字；全打过则回 0（通常是想重打）
       if (!Number.isFinite(this.charCursor) || this.charCursor > chars.length - 1) {

@@ -136,6 +136,122 @@ export function isCharTimed(line) {
   return chars.every((ch) => ch && Number.isFinite(/** @type {any} */ (ch).t))
 }
 
+/**
+ * 双语组里「主行」的下标（同时间、非翻译的那一行）。
+ *
+ * 【为什么需要这个】
+ * 双语歌词里原文与翻译是同一时间的两个物理行。打轴只该打原文 ——
+ * 翻译行的内容就是原文的译文，它没有自己的节奏，硬拆成两行去打只会得到
+ * 两个几乎相同的时间点（用户实测的痛点）。
+ * 所以翻译行一律"跟随主行"：时间跟随、逐字覆盖百分比也跟随。
+ *
+ * @param {Array<any>} lines 已按时间升序的歌词
+ * @param {number} index
+ * @returns {number} 主行下标；不是翻译行或找不到同组主行时返回自身
+ */
+export function mainLineIndexOf(lines, index) {
+  const arr = Array.isArray(lines) ? lines : []
+  const n = arr.length
+  const i = Number.isFinite(index) ? Math.trunc(index) : -1
+  if (i < 0 || i >= n) return -1
+
+  const line = arr[i]
+  if (!line || !line.isTranslation) return i
+
+  const t = /** @type {any} */ (line).t
+  // 同组的定义与 buildLogicalRows 一致：时间完全相同、且相邻
+  for (let k = i - 1; k >= 0; k--) {
+    if (/** @type {any} */ (arr[k]).t !== t) break
+    if (!/** @type {any} */ (arr[k]).isTranslation) return k
+  }
+  for (let k = i + 1; k < n; k++) {
+    if (/** @type {any} */ (arr[k]).t !== t) break
+    if (!/** @type {any} */ (arr[k]).isTranslation) return k
+  }
+  return i
+}
+
+/**
+ * 可打轴的「行下标」列表 —— 双语时翻译行不参与。
+ *
+ * 【为什么放在 core 而不是 store】
+ * 这条规则有两个消费者：打轴 store（决定"下一行打哪"）与界面（显示"第几/共几"）。
+ * 规则一旦分两处写，就会出现"光标跳到翻译行、但进度只算 9 行"这种自相矛盾的界面。
+ *
+ * @param {Array<any>} lines
+ * @returns {number[]} 可打轴的行下标；输入非法时返回空数组
+ */
+export function tapSlotIndexes(lines) {
+  const arr = Array.isArray(lines) ? lines : []
+  const out = []
+  for (let i = 0; i < arr.length; i++) {
+    const line = arr[i]
+    if (!line || line.isTranslation) continue
+    out.push(i)
+  }
+  // 整份文件都是翻译行（数据异常）→ 退回全部行，否则一行都打不了
+  return out.length ? out : arr.map((_, i) => i)
+}
+
+/**
+ * 与第 index 行同组、需要跟随它的翻译行下标。
+ *
+ * "同组"与 buildLogicalRows / 渲染层同口径：时间相同且相邻。
+ * 判定用的是**行当前的时间**（打轴草稿不会改 lines），所以反复打轴也稳定。
+ *
+ * @param {Array<any>} lines
+ * @param {number} index
+ * @returns {number[]}
+ */
+export function partnerIndexesOf(lines, index) {
+  const arr = Array.isArray(lines) ? lines : []
+  const line = arr[index]
+  if (!line) return []
+  // 只有主行才能"带动"同组：翻译行不驱动任何人，避免误用后互相覆盖
+  if (/** @type {any} */ (line).isTranslation) return []
+  const t = /** @type {any} */ (line).t
+  const out = []
+  for (let k = index - 1; k >= 0 && arr[k] && /** @type {any} */ (arr[k]).t === t; k--) {
+    if (/** @type {any} */ (arr[k]).isTranslation) out.push(k)
+  }
+  for (let k = index + 1; k < arr.length && arr[k] && /** @type {any} */ (arr[k]).t === t; k++) {
+    if (/** @type {any} */ (arr[k]).isTranslation) out.push(k)
+  }
+  return out
+}
+
+/**
+ * 某一行应当显示的逐字进度（0~1）；null 表示这行没有逐字数据。
+ *
+ * 【翻译行的进度从哪来】
+ * 翻译行自己通常没有逐字时间（打轴只打原文），若返回 null，它就会一直
+ * 停在当前行色、与原文脱节。这里让它**跟随同组主行的百分比**：
+ * 原文唱到 40%，翻译行就从左往右覆盖 40% —— 这就是预览与导出共同的口径。
+ *
+ * 翻译行如果有自己的 chars（历史数据/手动补过），优先用自己那份，
+ * 不覆盖用户已有的精确数据。
+ *
+ * @param {Array<any>} lines
+ * @param {number} index
+ * @param {number} timeSec
+ * @param {'smooth'|'step'} [mode]
+ * @returns {number|null}
+ */
+export function charProgressForLine(lines, index, timeSec, mode = DEFAULT_CHAR_PROGRESS_MODE) {
+  const arr = Array.isArray(lines) ? lines : []
+  const line = arr[index]
+  if (!line) return null
+
+  if (isCharTimed(line)) return charProgressAt(line.chars, timeSec, mode)
+
+  const main = mainLineIndexOf(arr, index)
+  if (main >= 0 && main !== index) {
+    const target = arr[main]
+    if (target && isCharTimed(target)) return charProgressAt(target.chars, timeSec, mode)
+  }
+  return null
+}
+
 // ── 拆字（标点跟随前字，空格不单独成字）──────────
 
 /**
@@ -280,6 +396,23 @@ export function createCharTapState() {
  * @param {number} t 音频真实播放位置（秒）
  * @returns {{ok:boolean, blocked?:boolean, reason?:string, lineIndex?:number, charIndex?:number, c?:string, t?:number, isNew?:boolean, nextLineIndex?:number, nextCursor?:number}}
  */
+/**
+ * 从 from 之后找下一行「可逐字打轴的主行」。
+ * 跳过翻译行（跟随主行），也跳过没有正文的行（空行/间奏）。
+ * @param {Array<any>} lines
+ * @param {number} from
+ * @returns {number} 下标；没有则 -1
+ */
+function nextTappableLineIndex(lines, from) {
+  for (let i = from + 1; i < lines.length; i++) {
+    const line = lines[i]
+    if (!line || line.isTranslation) continue
+    if (charTapRefusal(line)) continue
+    return i
+  }
+  return -1
+}
+
 export function charTapStep(state, lines, t) {
   if (!state || typeof state !== 'object' || !state.drafts) {
     return { ok: false, blocked: true, reason: '逐字打轴状态缺失' }
@@ -334,9 +467,17 @@ export function charTapStep(state, lines, t) {
   while (next < chars.length && !isTappableChar(chars[next].c)) next++
 
   if (next >= chars.length) {
-    // 本行打完：末行就停在「末尾之后」（下一次按键覆盖末字），否则换到下一行
-    if (li < list.length - 1) {
-      state.lineIndex = li + 1
+    /*
+     * 本行打完：换到**下一行可打轴的主行**。
+     *
+     * 【为什么要跳过翻译行】
+     * 双语歌词里翻译行紧跟着原文，它没有自己的节奏 —— 让光标停到它上面，
+     * 用户就得给译文也逐字打一遍，得到的是与原文几乎重复的一串时间。
+     * 翻译行的进度改为跟随主行百分比（见 charProgressForLine），所以这里直接跳过。
+     */
+    const nextLine = nextTappableLineIndex(list, li)
+    if (nextLine >= 0) {
+      state.lineIndex = nextLine
       state.cursor = 0
     } else {
       state.lineIndex = li

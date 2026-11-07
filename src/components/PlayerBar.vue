@@ -36,8 +36,12 @@ const durationText = computed(() => (duration.value > 0 ? formatClock(duration.v
 const progressPercent = computed(() => `${(player.progress * 100).toFixed(3)}%`)
 const volumePercent = computed(() => `${((muted.value ? 0 : volume.value) * 100).toFixed(1)}%`)
 
-/** 打轴总行数（按**目标行数组**算：纯 txt 打无时间行，纯 lrc 打有时间行） */
-const tappingTotal = computed(() => tapping.tapTarget.length)
+/**
+ * 打轴总行数。
+ * 用 totalCount 而不是 tapTarget.length —— 双语歌词里翻译行跟随主行，
+ * 不计入打轴进度（否则 17 个物理行会显示成"共 17 行"，实际只需打 9 次）。
+ */
+const tappingTotal = computed(() => tapping.totalCount)
 
 /**
  * 要显示节拍序号的行的 beat；没有则 null。
@@ -323,7 +327,7 @@ function cycleRate() {
       但"空文件进打轴模式"仍会走到这里，所以必须处理。
     -->
     <span v-if="tapping.enabled" class="playerbar__tapping" role="status">
-      <template v-if="tappingTotal > 0">打轴中 {{ tapping.editingIndex + 1 }}/{{ tappingTotal }}</template>
+      <template v-if="tappingTotal > 0">打轴中 {{ tapping.tapSlotOrdinal }}/{{ tappingTotal }}</template>
       <template v-else>打轴中 · 无行可打</template>
     </span>
 
