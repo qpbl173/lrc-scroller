@@ -426,6 +426,44 @@ function onOpenTapping() {
 
           <label class="field">
             <span class="field__label">
+              双语行间距
+              <em class="field__value">{{ s.font.bilingualGap }}{{ META['font.bilingualGap'].unit }}</em>
+            </span>
+            <input
+              class="field__control"
+              type="range"
+              :min="META['font.bilingualGap'].min"
+              :max="META['font.bilingualGap'].max"
+              :step="META['font.bilingualGap'].step"
+              :value="s.font.bilingualGap"
+              @input="settings.set('font.bilingualGap', Number($event.target.value))"
+            />
+          </label>
+
+          <label class="field">
+            <span class="field__label">
+              双语字号
+              <em class="field__value">{{ Math.round(s.font.bilingualScale * 100) }}%</em>
+            </span>
+            <input
+              class="field__control"
+              type="range"
+              :min="META['font.bilingualScale'].min"
+              :max="META['font.bilingualScale'].max"
+              :step="META['font.bilingualScale'].step"
+              :value="s.font.bilingualScale"
+              @input="settings.set('font.bilingualScale', Number($event.target.value))"
+            />
+          </label>
+
+          <p class="group__note">
+            以上两项只作用于「同一时间轴的原文/译文」这一对（双语歌词）：
+            行间距是压缩量，0 表示保持默认，数值越大译文越贴近原文；
+            字号是译行相对原行的比例。单语歌词与不同双语组之间不受影响。
+          </p>
+
+          <label class="field">
+            <span class="field__label">
               当前行放大
               <em class="field__value">{{ s.font.scale }}{{ META['font.scale'].unit }}</em>
             </span>

@@ -44,6 +44,16 @@ const props = defineProps({
    * @type {import('vue').PropType<number|null>}
    */
   charProgress: { type: Number, default: null },
+  /**
+   * 是否是双语组内、位于第一行之后的那一行（原文/译文的"第二行"）。
+   *
+   * 【为什么由父级算，而不是在这里看 line.isTranslation】
+   * 判定要区分"组内非首行"与"组首行"：文件里译文写在原文前面时，
+   * 第二行是主行（isTranslation=false），但双语间距照样要压紧。
+   * 组归并逻辑只有一份（core/fade.js 的 markBilingualSeconds），
+   * 父级算好传进来，避免这里再造一套判定而与虚化/导出走偏。
+   */
+  bilingualSecond: { type: Boolean, default: false },
 })
 
 const label = () => (props.line.empty ? '（间奏）' : props.line.text)
@@ -84,6 +94,7 @@ const style = () => {
       'is-past': past && !active,
       'is-empty': line.empty,
       'is-translation': line.isTranslation,
+      'is-bilingual-second': bilingualSecond,
       'has-fade': opacity !== null && opacity !== undefined,
     }"
     :style="style()"
@@ -259,11 +270,29 @@ const style = () => {
 }
 
 /*
+  双语组内的第二行：按「双语行间距」设置把这一行往上收。
+  
+  【为什么用负 margin，而不是改 min-height / padding】
+  margin 不改变行盒自身的高度与文字垂直居中，只改变它与**上一行**的距离 ——
+  正好对应需求"只压缩同一时间轴双语两行之间"。
+  若改 min-height，双语组与普通行的高度都会变，滚动测量、行距全部被牵连。
+  
+  【单位 em 相对基准字号】
+  .lyric-line 的 font-size 就是 --lrc-font-size（基准字号），
+  所以 em 与设置面板里的 em 语义一致；默认 0em 时 margin 为 0，
+  渲染结果与没有这个功能时逐像素一致。
+*/
+.lyric-line.is-bilingual-second {
+  margin-top: calc(-1 * var(--lrc-bilingual-gap, 0em));
+}
+
+/*
   翻译行：同时间的第二行（双语歌词）。
   缩小字号并降低不透明度，让主歌词保持视觉主导。
+  比例来自设置项 font.bilingualScale（默认 0.62，即改动前的观感）。
 */
 .lyric-line.is-translation .lyric-line__text {
-  font-size: 0.62em;
+  font-size: calc(1em * var(--lrc-bilingual-scale, 0.62));
 }
 
 .lyric-line.is-translation:not(.has-fade) .lyric-line__text {

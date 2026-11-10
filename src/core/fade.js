@@ -92,6 +92,43 @@ export function buildLogicalRows(lines) {
 }
 
 /**
+ * 标记「双语组内、位于第一行之后」的物理行。
+ *
+ * 【为什么需要它】
+ * 双语行间距设置只该压紧「同一时间轴的原文/译文」这一对之间的空隙，
+ * 不能碰双语组与双语组之间、以及普通单语行之间的行距。
+ * 判定必须是"组内非首行"而不是"isTranslation"：
+ *   - 文件顺序可能是「译文、原文」，此时第二行是主行（isTranslation=false），
+ *     按 isTranslation 判定会漏掉这一组；
+ *   - 组内首行前面接的是别的组，若给它加负间距，就会把组间距也一起压缩。
+ *
+ * 组的归并与虚化完全一致（buildLogicalRows，按时间相同归并）；
+ * 只有组内**至少有一行**被解析器标记为翻译行，才算双语组
+ * （见 lrcParser 的 looksLikeTranslationGroup / isTranslation）。
+ *
+ * @param {Array<{t:number, isTranslation?:boolean}>} lines 必须已按时间升序
+ * @returns {Uint8Array} 1 = 该行是双语组内的第二行及以后（应用双语间距）
+ */
+export function markBilingualSeconds(lines) {
+  const arr = Array.isArray(lines) ? lines : []
+  const n = arr.length
+  const out = new Uint8Array(n)
+  if (n < 2) return out
+
+  const { rowOf, rowCount } = buildLogicalRows(arr)
+  /** 每个逻辑行是否为双语组 */
+  const bilingual = new Uint8Array(rowCount)
+  for (let i = 0; i < n; i++) {
+    if (arr[i]?.isTranslation) bilingual[rowOf[i]] = 1
+  }
+
+  for (let i = 1; i < n; i++) {
+    if (rowOf[i] === rowOf[i - 1] && bilingual[rowOf[i]]) out[i] = 1
+  }
+  return out
+}
+
+/**
  * 应用缓动曲线。
  *
  * @param {number} p 归一化进度 0~1

@@ -38,11 +38,11 @@
  */
 import { charProgressForLine } from './charProgress.js'
 import { hexToRgb } from './color.js'
-import { computeRenderOpacities, createDefaultFade } from './fade.js'
+import { computeRenderOpacities, createDefaultFade, markBilingualSeconds } from './fade.js'
 import { smoothTowards, computeCenteringOffset } from './scroll.js'
 import { findLineIndexAt } from './timeUtils.js'
 import { easeCurve, transitionCurve, progress, lerp } from './motion.js'
-import { resolveStrokeColor } from './settings.js'
+import { DEFAULT_BILINGUAL_SCALE, resolveStrokeColor } from './settings.js'
 
 /** 设计基准高度（px）：字号以这个高度为准定义 */
 export const BASE_HEIGHT = 1080
@@ -60,10 +60,13 @@ export const SCROLL_SETTLE_MS = 90
 export const LINE_PADDING_EM = 0.18
 
 /**
- * 翻译行的字号比例（见 LyricLine.vue 的
- * `.lyric-line.is-translation .lyric-line__text { font-size: 0.62em }`）。
+ * 翻译行的默认字号比例（见 LyricLine.vue 的
+ * `.lyric-line.is-translation .lyric-line__text { font-size: calc(1em * var(--lrc-bilingual-scale)) }`）。
+ *
+ * 实际生效值来自 settings.font.bilingualScale；这里保留常量作为兜底，
+ * 并继续导出给已有单测引用（值必须等于 core/settings.js 的默认值）。
  */
-export const TRANSLATION_FONT_EM = 0.62
+export const TRANSLATION_FONT_EM = DEFAULT_BILINGUAL_SCALE
 
 /**
  * 间奏空行的占位文字（见 LyricLine.vue 的 `label()`）。
@@ -316,15 +319,35 @@ export function measureRowLayout({
 
   const useDom = Array.isArray(domHeights) && domHeights.length === arr.length
 
+  /*
+   * 双侧语设置（与预览的 --lrc-bilingual-scale / --lrc-bilingual-gap 同源）：
+   *  - scale：译行字号比例，非法值回落到改动前的 0.62
+   *  - gap  ：双语组内第二行的间距压缩量（em，相对基准字号），0 = 不动
+   *
+   * gap 必须在**画布像素**里换算，因为这里的 baseFontSize 已乘过缩放系数 k，
+   * 与预览"em 相对基准字号"的语义一致。
+   */
+  const scaleCfg = Number(settings?.font?.bilingualScale)
+  const translationEm = Number.isFinite(scaleCfg) && scaleCfg > 0 ? scaleCfg : TRANSLATION_FONT_EM
+  const gapCfg = Number(settings?.font?.bilingualGap)
+  const bilingualGapPx = (Number.isFinite(gapCfg) && gapCfg > 0 ? gapCfg : 0) * baseFontSize
+  const bilingualSecond = markBilingualSeconds(arr)
+
   /** @type {Array<any>} */
   const rows = []
   let top = Number.isFinite(padTopPx) ? padTopPx : 0
 
   for (let i = 0; i < arr.length; i++) {
+    /*
+     * 双语组内第二行：负 margin 不参与 offsetHeight，浏览器把行盒整体上移。
+     * 所以这里要**手动**把累计高度减去同样的量，画布的行位置才与预览一致。
+     */
+    if (bilingualSecond[i] === 1 && bilingualGapPx > 0) top -= bilingualGapPx
+
     const line = arr[i] || {}
     const isTranslation = !!line.isTranslation
     const isEmpty = !!line.empty
-    const drawSize = isTranslation ? baseFontSize * TRANSLATION_FONT_EM : baseFontSize
+    const drawSize = isTranslation ? baseFontSize * translationEm : baseFontSize
 
     // 空行走预览的 label()：画占位文字而不是留白。
     // 占位文字用正文尺寸排版（预览的 label() 就在 .lyric-line__text 里，

@@ -27,7 +27,7 @@ import { useAutoScroll } from '@/composables/useAutoScroll'
 import { useTappingStore } from '@/stores/tappingStore'
 import { registerTappingAuto } from '@/composables/useTapping'
 import { registerAutoScroll, registerTapping } from '@/devtools/diagHooks'
-import { buildLogicalRows, createFadeEngine } from '@/core/fade'
+import { buildLogicalRows, createFadeEngine, markBilingualSeconds } from '@/core/fade'
 import LyricLine from '@/components/LyricLine.vue'
 import { charProgressForLine } from '@/core/charProgress'
 import UntimedLine from '@/components/UntimedLine.vue'
@@ -128,6 +128,17 @@ function isActiveRow(i) {
   }
   return true
 }
+
+/**
+ * 双语组内"第二行及以后"的标记。
+ *
+ * 【为什么只在双语组内生效】
+ * 「双语行间距」是给原文/译文这一对用的。组与组之间、普通单语行之间
+ * 仍由 font.lineHeight 统一控制，不能被这个设置波及。
+ * 判定与虚化共用 buildLogicalRows（按时间相同归并），
+ * 只有组内出现过翻译行才算双语组 —— 单语歌词下整张表全 0，没有任何额外间距。
+ */
+const bilingualSeconds = computed(() => markBilingualSeconds(lyrics.lines))
 
 const fadeConfig = computed(() => settings.settings.fade)
 
@@ -548,6 +559,7 @@ const showEmpty = computed(() => !hasLyrics.value && !showUntimed.value && !tapp
             :tapped="isTappedRow(i)"
             :opacity="opacityOf(i)"
             :char-progress="charProgressOf(i)"
+            :bilingual-second="bilingualSeconds[i] === 1"
           />
 
           <div class="stage__pad" :style="{ height: `${padBottomPx}px` }" aria-hidden="true" />

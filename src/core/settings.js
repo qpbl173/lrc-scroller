@@ -11,6 +11,16 @@ import { hexToHsl, hslToHex } from './color.js'
 
 export const SETTINGS_VERSION = 1
 
+/**
+ * 双语歌词里"第二行"的默认字号比例（相对原行）。
+ *
+ * 【为什么是 0.62】
+ * 这是改动前的写死值（LyricLine.vue 的 `.is-translation .lyric-line__text`），
+ * 把它提成设置项的默认值，才能保证"升级后观感零变化"。
+ * core/renderFrame.js 也引用它作为 canvas 的兜底值，两边同源。
+ */
+export const DEFAULT_BILINGUAL_SCALE = 0.62
+
 /** @typedef {ReturnType<typeof createDefaultSettings>} Settings */
 
 export function createDefaultSettings() {
@@ -34,6 +44,23 @@ export function createDefaultSettings() {
       letterSpacing: 0.02, // em
       lineHeight: 1.6, // 倍数
       scale: 1.35, // 当前行放大比例
+      /**
+       * 双语行间距压缩量（em，相对基准字号）。
+       *
+       * 【语义：只压缩同一时间轴的双语行之间，默认 0 = 保持原观感】
+       * 双语歌词里原文与译文是两个物理行，各自按基准字号占一行高度，
+       * 于是两行之间的空隙看起来像"两句不相关的歌词"（用户反馈）。
+       * 这里给出一个**压缩量**而不是绝对间距：0 表示不做任何改动，
+       * 调大则把第二行往上收。只作用于双语组内部，
+       * 不同双语组之间、普通单语行之间的间距完全不受影响
+       * （见 LyricLine.vue 的 .is-bilingual-second）。
+       */
+      bilingualGap: 0,
+      /**
+       * 双语第二行（译行）的字号比例，相对原行。
+       * 默认 0.62 = 改动前的写死值，老用户升级后观感不变。
+       */
+      bilingualScale: DEFAULT_BILINGUAL_SCALE,
     },
 
     color: {
@@ -359,6 +386,10 @@ export const FIELD_META = {
   'font.letterSpacing': { min: -0.1, max: 1, step: 0.01, unit: 'em' },
   'font.lineHeight': { min: 1, max: 4, step: 0.05, unit: '倍' },
   'font.scale': { min: 1, max: 3, step: 0.01, unit: '倍' },
+  // 双语行间距：压缩量，单位 em（相对基准字号）。0 = 不动
+  'font.bilingualGap': { min: 0, max: 1.5, step: 0.05, unit: 'em' },
+  // 双语字号：译行相对原行的比例（60%~120%）
+  'font.bilingualScale': { min: 0.6, max: 1.2, step: 0.01, unit: '倍' },
   // 描边：宽度上限 0.3em —— 再粗就会糊住字形，尤其在小字号下
   'stroke.width': { min: 0, max: 0.3, step: 0.005, unit: 'em' },
   'stroke.brightness': { min: 0, max: 100, step: 1, unit: '%' },
@@ -446,6 +477,9 @@ export function sanitizeSettings(raw) {
   out.font.letterSpacing = pick(raw, 'font.letterSpacing', d.font.letterSpacing)
   out.font.lineHeight = pick(raw, 'font.lineHeight', d.font.lineHeight)
   out.font.scale = pick(raw, 'font.scale', d.font.scale)
+  // 旧配置没有这两个字段 → 自动落到默认值（0 / 0.62），观感与升级前一致
+  out.font.bilingualGap = pick(raw, 'font.bilingualGap', d.font.bilingualGap)
+  out.font.bilingualScale = pick(raw, 'font.bilingualScale', d.font.bilingualScale)
 
   out.color.normal = normalizeColor(pick(raw, 'color.normal', d.color.normal), d.color.normal)
   out.color.active = normalizeColor(pick(raw, 'color.active', d.color.active), d.color.active)
@@ -627,6 +661,9 @@ export function toCssVars(s) {
     '--lrc-letter-spacing': `${s.font.letterSpacing}em`,
     '--lrc-line-height': String(s.font.lineHeight),
     '--lrc-active-scale': String(s.font.scale),
+    // 双语：间距压缩量（em，0 时 margin 为 0，等价于旧行为）与译行字号比例
+    '--lrc-bilingual-gap': `${s.font.bilingualGap}em`,
+    '--lrc-bilingual-scale': String(s.font.bilingualScale),
     '--lrc-color-normal': s.color.normal,
     '--lrc-color-active': s.color.active,
     '--lrc-color-tapped': s.color.tapped,
